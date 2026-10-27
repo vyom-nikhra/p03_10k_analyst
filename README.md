@@ -74,5 +74,35 @@ Every line should show `[ OK ]`. The first run downloads the dataset and two sma
 Open the notebook in Colab and run it top to bottom. The setup section detects Colab, installs Ollama with the official script, starts `ollama serve` in the background and pulls both models. Torch is already installed on Colab.
 
 ## Running the notebook
-- `QUICK_RUN = True` (the default) evaluates a small fixed sample, so the whole notebook runs in well under an hour.
-- `USE_CACHED_PREDS = True` loads the saved full-run predictions from `artifacts/preds/` and re-scores them live. These come from full evaluation runs done once and saved.
+The notebook source is `P03_Financial_10K_Analyst.py`, in jupytext "percent" format. Build the `.ipynb` from it, then execute it:
+```
+python -m jupytext --to ipynb P03_Financial_10K_Analyst.py
+python -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 P03_Financial_10K_Analyst.ipynb
+```
+
+Flags are set at the top of the notebook, or with environment variables of the same name:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `QUICK_RUN` | `1` | Evaluates the 40-question quick subset live. |
+| `USE_CACHED_PREDS` | `1` | With `QUICK_RUN=0`, scores the full test set from saved predictions in `artifacts/preds/`, with no live LLM runs. |
+| `GENERATE_DERIVED` | `0` | Lets the LLM generate missing derived calculation questions. |
+
+**Full evaluation run** (several hours; meant for the RTX 4070 laptop). It resumes where it stopped if interrupted.
+
+PowerShell:
+```
+$env:QUICK_RUN="0"; $env:USE_CACHED_PREDS="0"
+python -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 P03_Financial_10K_Analyst.ipynb
+```
+
+## Human labelling (teammates)
+The notebook exports the files below to `artifacts/labels/`. Fill one in and save it under its "completed" name; the notebook picks it up on the next run. Exports are never overwritten.
+
+| Export | Fill in | Save as |
+|---|---|---|
+| `qtype_sample_to_label.csv` | `human_label` (text_lookup / numeric_lookup / calculation / unexplained) | `qtype_human_labels.csv` |
+| `real_calc_to_verify.csv` | `verified` (yes/no), `note` | `real_calc_verified.csv` |
+| `derived_calc_to_verify.csv` | `verified` (yes/no), `note` | `derived_calc_verified.csv` |
+| `judge_validation_to_label.csv` | `human_correct` (yes/no) | `judge_validation_labels.csv` |
+| `failures_to_categorize.csv` | `human_category`, `what_to_change` | `failures_categorized.csv` |

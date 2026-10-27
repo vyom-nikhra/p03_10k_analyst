@@ -57,6 +57,7 @@
 # %pip install -q datasets==5.1.0 sentence-transformers==6.2.0 transformers==5.21.0 faiss-cpu==1.15.1 rank-bm25==0.2.2 scikit-learn==1.9.1 langgraph==1.2.18 langchain-core==1.7.0 langchain-ollama==1.1.0 pydantic==2.14.1 pandas==3.1.0 numpy==2.4.6 matplotlib==3.11.2
 
 # %%
+import hashlib
 import json
 import math
 import os
@@ -80,8 +81,9 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-QUICK_RUN = True          # True: evaluate a small fixed sample live, for a fast end-to-end run
-USE_CACHED_PREDS = True   # True: load saved full-run predictions from artifacts/preds and re-score them
+# Flags (environment variables override the defaults, so a full run can be started without editing the notebook)
+QUICK_RUN = os.environ.get("QUICK_RUN", "1") == "1"                # True: evaluate a small fixed sample live
+USE_CACHED_PREDS = os.environ.get("USE_CACHED_PREDS", "1") == "1"  # True: full set from artifacts/preds, no live runs
 GENERATE_DERIVED = os.environ.get("GENERATE_DERIVED", "0") == "1"   # True: let the LLM generate missing derived items
 IN_COLAB = "google.colab" in sys.modules
 
@@ -457,7 +459,6 @@ print("real calculation items:", int((df.qtype == "calculation").sum()),
 # Every derived item is labelled `derived_calculation` and reported separately from real questions.
 
 # %%
-import hashlib
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -683,8 +684,9 @@ print(f"quick subset: {len(quick_ids)} questions")
 #   "$132.4M" (dev check, logbook 2026-10-28). That is why the rule checks run first. Section 6 validates the
 #   combined verdict against human labels.
 # - **Numeric accuracy** (calculation questions): every gold number must appear in the answer within 1%. Answers
-#   written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`, and so do numbers written without a
-#   scale word (thousands vs millions). The sign is ignored, because answers phrase decreases in words.
+#   written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`. The scale (thousand / million / billion)
+#   is checked only when both the answer and the gold state one: "$1,318 million" matches a gold "$1,318.0" taken
+#   from a table in millions. The sign is ignored, because answers phrase decreases in words.
 # - **Calculator use**, **citation accuracy** (the cited passage is a relevant one), and **cost** (seconds, LLM
 #   calls and tokens per question).
 
@@ -695,16 +697,21 @@ print(f"evaluation set: {'quick subset' if QUICK_RUN else 'full test set'}, {len
 display(eval_q.qtype.value_counts().rename("questions").to_frame())
 
 
+# Bump a version whenever that system's prompt or code changes. It is part of the cache file name, so predictions
+# made by an older version are never reused.
+BASELINE_VERSION, AGENT_VERSION = "v1", "v1"
+
+
 def live_allowed(kind):
     if USE_CACHED_PREDS and not QUICK_RUN:
         raise RuntimeError(f"{kind} missing from the cache and USE_CACHED_PREDS = True. Run the full evaluation once "
                            "with USE_CACHED_PREDS = False (several hours on a laptop GPU) or set QUICK_RUN = True.")
 
 
-def run_condition(name, answer_fn, qs=None):
+def run_condition(name, answer_fn, version, qs=None):
     """Predictions for one condition: cached rows are reused, missing ones are computed by answer_fn(row)."""
     qs = eval_q if qs is None else qs
-    store = JsonlStore(ART / "preds" / f"{name}__{MODEL_TAG}.jsonl")
+    store = JsonlStore(ART / "preds" / f"{name}__{MODEL_TAG}__{version}.jsonl")
     stale = [r.qid for r in qs.itertuples() if r.qid in store and store[r.qid]["question"] != r.question]
     if stale:
         raise RuntimeError(f"cached predictions in {store.path} were made for different question text: {stale[:5]}")
@@ -729,6 +736,7 @@ JUDGE_TEMPLATE = (
     "Reply with exactly one word: YES or NO.")
 JUDGE_VERSION = "strict-v1"     # part of the cache file name: changing the prompt must not reuse old verdicts
 judge_llm = get_llm(CONFIG["judge_model"], num_predict=5)
+judge_store = JsonlStore(ART / "judge" / f"{CONFIG['judge_model'].replace(':', '-')}__{JUDGE_VERSION}.jsonl")
 REFUSAL_RE = re.compile(
     r"\b(?:does not|doesn't|do not|did not|cannot|can't|unable to)\s+(?:\w+\s+){0,3}?"
     r"(?:contain|provide|include|mention|disclose|specify|report|find|answer)\b"
@@ -742,31 +750,36 @@ def judge_answer(question, gold, pred):
     return (m.group(1) == "YES") if m else None, raw[:40]
 
 
+def judge_key(question, gold, answer):
+    return hashlib.sha1(f"{question}\n{gold}\n{answer}".encode()).hexdigest()[:20]
+
+
 def judge_condition(name, preds, qs=None):
+    """LLM verdicts, cached by (question, gold, answer): any answer the judge has seen before is not re-judged."""
     qs = eval_q if qs is None else qs
-    store = JsonlStore(ART / "judge" / f"{name}__{MODEL_TAG}__{CONFIG['judge_model'].replace(':', '-')}"
-                                       f"__{JUDGE_VERSION}.jsonl")
     answers = dict(zip(preds.id, preds.answer))
-    stale = [q for q in qs.qid if q in store and store[q]["answer"] != answers[q]]
-    if stale:
-        raise RuntimeError(f"judge cache {store.path} holds verdicts for different answers: {stale[:5]}")
-    missing = [r for r in qs.itertuples() if r.qid not in store]
+    keys = {r.qid: judge_key(r.question, r.gold_answer, answers[r.qid]) for r in qs.itertuples()}
+    missing = [r for r in qs.itertuples() if keys[r.qid] not in judge_store]
     if missing:
         live_allowed(f"{len(missing)} judge verdicts for {name!r} are")
         for r in missing:
             ok, raw = judge_answer(r.question, r.gold_answer, answers[r.qid])
-            store.add({"id": r.qid, "answer": answers[r.qid], "correct": ok, "raw": raw})
-    return {q: store[q]["correct"] for q in qs.qid}
+            judge_store.add({"id": keys[r.qid], "qid": r.qid, "answer": answers[r.qid], "correct": ok, "raw": raw})
+    return {q: judge_store[k]["correct"] for q, k in keys.items()}
 
 
-def numeric_correct(answer, gold_numbers):
+def numeric_correct(answer, gold_numbers, gold_answer):
+    """Every gold number appears in `answer` within 1%. A gold answer with no scale word (e.g. "$1,318.0" from a
+    table in millions) does not fix the scale, so then the answer's scale is not checked either."""
     preds = extract_numbers(answer)
+    gold_unscaled = not any(n["scaled"] for n in extract_numbers(gold_answer))
 
     def hit(g):
         g = abs(g)
         for p in preds:
             v = abs(p["value"])
-            cands = [v, v * 100, v / 100] + ([v * 1000.0 ** k for k in (-3, -2, -1, 1, 2, 3)] if not p["scaled"] else [])
+            rescale = not p["scaled"] or gold_unscaled
+            cands = [v, v * 100, v / 100] + ([v * 1000.0 ** k for k in (-3, -2, -1, 1, 2, 3)] if rescale else [])
             if any(math.isclose(c, g, rel_tol=0.01) for c in cands):
                 return True
         return False
@@ -774,22 +787,24 @@ def numeric_correct(answer, gold_numbers):
     return all(hit(g) for g in gold_numbers) if gold_numbers else None
 
 
-assert numeric_correct("It grew by $5,606 million.", [5.606e9]) and numeric_correct("about 30.8%", [31.0])
-assert not numeric_correct("It grew by $5.6 billion and 12%.", [8.548e9])
-assert numeric_correct("Services were 0.125 of revenue", [12.5]) and not numeric_correct("$5.2 billion", [5.2e6])
+assert numeric_correct("It grew by $5,606 million.", [5.606e9], "$5.6 billion") and numeric_correct("about 30.8%", [31.0], "31%")
+assert not numeric_correct("It grew by $5.6 billion and 12%.", [8.548e9], "$8.5 billion")
+assert numeric_correct("Services were 0.125 of revenue", [12.5], "12.5%")
+assert not numeric_correct("$5.2 billion", [5.2e6], "$5.2 million") and numeric_correct("$1,318 million", [1318.0], "$1,318.0")
 
 CALC_TYPES = ("calculation", "derived_calculation")
 assert REFUSAL_RE.search("The 2023 annual report does not contain information about it")
 assert REFUSAL_RE.search("I'm sorry, but there is no publicly available report") and not REFUSAL_RE.search("Revenue was $5 billion")
 
 
-def rule_gate(qtype, answer, gold_numbers):
+def rule_gate(qtype, answer, gold_numbers, gold_answer):
     """Checks that run before the LLM judge: (passed, reason it failed)."""
     if REFUSAL_RE.search(answer):
         return False, "refusal"
-    if qtype in CALC_TYPES and not numeric_correct(answer, gold_numbers):
+    if qtype in CALC_TYPES and not numeric_correct(answer, gold_numbers, gold_answer):
         return False, "number mismatch"
-    if qtype == "numeric_lookup" and gold_numbers and not any(numeric_correct(answer, [g]) for g in gold_numbers):
+    if qtype == "numeric_lookup" and gold_numbers and not any(numeric_correct(answer, [g], gold_answer)
+                                                              for g in gold_numbers):
         return False, "number mismatch"
     return True, None
 
@@ -798,16 +813,16 @@ def score(name, preds, qs=None):
     """Per-question metrics for one condition, merged with the question table."""
     qs = eval_q if qs is None else qs
     verdicts = judge_condition(name, preds, qs)
-    p = qs.merge(preds.rename(columns={"id": "qid"}), on="qid")
+    p = qs.merge(preds.drop(columns="question").rename(columns={"id": "qid"}), on="qid")   # run_condition checked it
     p["condition"] = name
-    gates = [rule_gate(t, a, g) for t, a, g in zip(p.qtype, p.answer, p.gold_numbers)]
+    gates = [rule_gate(t, a, g, ga) for t, a, g, ga in zip(p.qtype, p.answer, p.gold_numbers, p.gold_answer)]
     p["refusal"] = [why == "refusal" for _, why in gates]
     p["llm_judge_ok"] = p.qid.map(verdicts)
     p["judge_ok"] = [False if not gate_ok else llm for (gate_ok, _), llm in zip(gates, p.llm_judge_ok)]
     p["fail_reason"] = [why if not ok else ("LLM judge" if llm is False else None)
                         for (ok, why), llm in zip(gates, p.llm_judge_ok)]
-    p["numeric_ok"] = [numeric_correct(a, g) if t in CALC_TYPES else None
-                       for a, g, t in zip(p.answer, p.gold_numbers, p.qtype)]
+    p["numeric_ok"] = [numeric_correct(a, g, ga) if t in CALC_TYPES else None
+                       for a, g, ga, t in zip(p.answer, p.gold_numbers, p.gold_answer, p.qtype)]
     p["calc_called"] = [any(c["name"] == "run_python" for c in tc) for tc in p.get("tool_calls", [[]] * len(p))]
     p["cited_ok"] = [c in rel if isinstance(c, str) else False for c, rel in zip(p.get("cited_doc", [None] * len(p)),
                                                                                 p.relevant_docs)]
@@ -841,7 +856,7 @@ def closed_book(r):
     return {"answer": text, **cost}
 
 
-preds_b0 = run_condition("B0_closed_book", closed_book)
+preds_b0 = run_condition("B0_closed_book", closed_book, BASELINE_VERSION)
 scored = {"B0_closed_book": score("B0_closed_book", preds_b0)}
 display(scored["B0_closed_book"].groupby("qtype")[["judge_ok", "numeric_ok"]].mean().round(3))
 
@@ -1397,7 +1412,8 @@ for r in dev_sample.itertuples():
     rec = run_agent(r.question, r.ticker)
     dev_runs.append({"qtype": r.qtype, "calc_called": any(c["name"] == "run_python" for c in rec["tool_calls"]),
                      "gold_retrieved": bool(set(rec["retrieved_docs"]) & set(r.relevant_docs)),
-                     "numeric_ok": numeric_correct(rec["answer"], r.gold_numbers) if r.qtype in CALC_TYPES else None,
+                     "numeric_ok": (numeric_correct(rec["answer"], r.gold_numbers, r.gold_answer)
+                                    if r.qtype in CALC_TYPES else None),
                      "latency_s": rec["latency_s"], "llm_calls": rec["llm_calls"]})
     print(f"\n=== [{r.qtype}] {r.question}\nGOLD   {r.gold_answer}")
     show_trace(rec)
@@ -1466,17 +1482,17 @@ def agent_condition(**kw):
     return lambda r: run_agent(r.question, r.ticker, **kw)
 
 
-CONDITIONS = {
-    "B0_closed_book": closed_book,
-    "B1_plain_rag": lambda r: rag_answer(r, RAG_PLAIN),
-    "B2_rag_cot": lambda r: rag_answer(r, RAG_COT),
-    "S_agent": agent_condition(),
-    "A1_agent_no_ticker_filter": agent_condition(use_filter=False),
-    "A2_agent_no_calculator": agent_condition(calculator=False),
+CONDITIONS = {   # name: (answer function, version of the system that produced the cached predictions)
+    "B0_closed_book": (closed_book, BASELINE_VERSION),
+    "B1_plain_rag": (lambda r: rag_answer(r, RAG_PLAIN), BASELINE_VERSION),
+    "B2_rag_cot": (lambda r: rag_answer(r, RAG_COT), BASELINE_VERSION),
+    "S_agent": (agent_condition(), AGENT_VERSION),
+    "A1_agent_no_ticker_filter": (agent_condition(use_filter=False), AGENT_VERSION),
+    "A2_agent_no_calculator": (agent_condition(calculator=False), AGENT_VERSION),
 }
-for name, fn in CONDITIONS.items():
+for name, (fn, version) in CONDITIONS.items():
     if name not in scored:
-        scored[name] = score(name, run_condition(name, fn))
+        scored[name] = score(name, run_condition(name, fn, version))
 print("scored:", list(scored))
 
 # %%
@@ -1512,3 +1528,188 @@ ax.set(title=f"Judge accuracy by question type ({'quick subset' if QUICK_RUN els
 ax.tick_params(axis="x", rotation=20)
 plt.tight_layout()
 plt.show()
+
+# %% [markdown]
+# ### 6.1 Is the judge trustworthy?
+#
+# Teammate B labels a stratified sample of answers from B1, B2 and S **blind** (without seeing the judge's
+# verdict). We then report agreement and Cohen's κ against the combined verdict and against the LLM judge alone.
+
+# %%
+val_pool = pd.concat([scored[c].assign(condition=c) for c in ("B1_plain_rag", "B2_rag_cot", "S_agent")])
+val_sample = pd.concat([g.sample(min(20, len(g)), random_state=SEED) for _, g in val_pool.groupby("condition")])
+export_once(val_sample[["condition", "qid", "question", "gold_answer", "answer"]].assign(human_correct=""),
+            "judge_validation_to_label.csv")
+val_path = LABELS / "judge_validation_labels.csv"
+if val_path.exists():
+    from sklearn.metrics import cohen_kappa_score
+    hv = pd.read_csv(val_path)
+    hv = hv[hv.human_correct.astype(str).str.strip().str.lower().isin(["yes", "no"])]
+    hv["human"] = hv.human_correct.str.strip().str.lower() == "yes"
+    hv = hv.merge(val_pool[["condition", "qid", "judge_ok", "llm_judge_ok"]], on=["condition", "qid"])
+    for col in ("judge_ok", "llm_judge_ok"):
+        ok = hv[col].notna()
+        print(f"{col:13s} vs human on {int(ok.sum())} answers: agreement {np.mean(hv.human[ok] == hv[col][ok].astype(bool)):.1%}, "
+              f"kappa {cohen_kappa_score(hv.human[ok], hv[col][ok].astype(bool)):.2f}")
+else:
+    print(f"PENDING: {val_path} not provided yet, so judge agreement with humans is not computed")
+
+# %% [markdown]
+# ### 6.2 Stretch goal: self-consistency on calculation questions
+#
+# **Self-consistency** samples several reasoning paths at temperature > 0 and takes a majority vote over their
+# answers. We run the full agent 3 times (T = 0.7, different seeds) on every calculation question and vote on the
+# answer's first figure, rounded to 3 significant digits. The run whose figure won supplies the final answer and
+# citation. Cost is the sum of all 3 runs.
+
+# %%
+def vote_key(answer):
+    nums = extract_numbers(answer)
+    return float(f"{abs(nums[0]['value']):.3g}") if nums else None
+
+
+def self_consistency(r, n=3):
+    runs = [run_agent(r.question, r.ticker, temperature=0.7, seed=SEED + i) for i in range(1, n + 1)]
+    keys = [vote_key(x["answer"]) for x in runs]
+    counts = Counter(k for k in keys if k is not None)
+    winner = max(counts, key=lambda k: (counts[k], -keys.index(k))) if counts else None
+    chosen = runs[keys.index(winner)] if winner is not None else runs[0]
+    return {**chosen, "votes": keys, "latency_s": round(sum(x["latency_s"] for x in runs), 2),
+            "llm_calls": sum(x["llm_calls"] for x in runs), "input_tokens": sum(x["input_tokens"] for x in runs),
+            "output_tokens": sum(x["output_tokens"] for x in runs)}
+
+
+calc_q = eval_q[eval_q.qtype.isin(CALC_TYPES)]
+scored["SC3_agent"] = score("SC3_agent", run_condition("SC3_agent", self_consistency, AGENT_VERSION, calc_q), calc_q)
+s_calc = scored["S_agent"][scored["S_agent"].qtype.isin(CALC_TYPES)]
+sc_table = pd.DataFrame([{"condition": n, "judge acc": p.judge_ok.astype(float).mean(),
+                          "numeric acc": p.numeric_ok.astype(float).mean(), "s / question": p.latency_s.mean(),
+                          "LLM calls / q": p.llm_calls.mean(), "tokens / q": (p.input_tokens + p.output_tokens).mean()}
+                         for n, p in (("S_agent (greedy, 1 run)", s_calc), ("SC3_agent (3 runs, vote)", scored["SC3_agent"]))])
+display(sc_table.set_index("condition").round(3))
+
+# %% [markdown]
+# ## 7. Error Analysis
+#
+# The failures below are the full agent's (S) wrong answers. Each gets a first-pass category from its trace:
+# - **retrieval miss:** no search returned a relevant passage.
+# - **refused:** the right passage was retrieved, but the agent said the answer wasn't there.
+# - **calculator not called:** a calculation question answered without `run_python`.
+# - **wrong figure or formula:** the calculator was used, but on the wrong numbers or with the wrong operation.
+# - **wrong figure (lookup):** a lookup answer whose figure doesn't match the gold.
+# - **step limit:** the agent hit the step limit.
+# - **judge disagrees (text):** the rules passed but the LLM judge said no. This may be a wrong answer or a judge
+#   error.
+#
+# Teammate C checks every case, corrects the category where needed, and notes what we would change
+# (`failures_to_categorize.csv` → `failures_categorized.csv`).
+
+# %%
+def auto_category(r):
+    if "step_limit" in r.nudges:
+        return "step limit"
+    if r.gold_retrieved is False:
+        return "retrieval miss"
+    if r.refusal:
+        return "refused (passage was retrieved)"
+    if r.qtype in CALC_TYPES and not r.calc_called:
+        return "calculator not called"
+    if r.qtype in CALC_TYPES:
+        return "wrong figure or formula"
+    if r.fail_reason == "number mismatch":
+        return "wrong figure (lookup)"
+    return "judge disagrees (text)"
+
+
+s_res = scored["S_agent"]
+failures = s_res[s_res.judge_ok.map(lambda v: v is False)].copy()   # None = no verdict, not a failure
+failures["auto_category"] = [auto_category(r) for r in failures.itertuples()]
+print(f"S failures: {len(failures)} of {len(s_res)}")
+display(failures.auto_category.value_counts().rename("failures").to_frame())
+pd.set_option("display.max_colwidth", 160)
+display(failures[["qid", "qtype", "question", "gold_answer", "answer", "auto_category"]].head(25))
+export_once(failures[["qid", "qtype", "question", "gold_answer", "answer", "auto_category"]]
+            .assign(human_category="", what_to_change=""), "failures_to_categorize.csv")
+cat_path = LABELS / "failures_categorized.csv"
+if cat_path.exists():
+    fc = pd.read_csv(cat_path)
+    display(fc.human_category.value_counts().rename("failures (human categories)").to_frame())
+else:
+    print(f"PENDING: {cat_path} not provided yet")
+
+# %% [markdown]
+# ## 8. Demo
+#
+# `ask(question, ticker)` runs the full system on one question and prints how it got there: every tool call, what
+# came back, the final answer and the cited passage.
+
+# %%
+def ask(question: str, ticker: str = None):
+    """Run the full system on one input and print the answer and the agent trace."""
+    rec = run_agent(question, ticker)
+    show_trace(rec)
+    if rec["cited_doc"] in row_of:
+        print(f"\ncited passage {rec['cited_doc']}: {doc_text[row_of[rec['cited_doc']]]}")
+    return rec
+
+
+_ = ask("By how much did total operating expenses increase from 2022 to 2023, in percent?", ticker="DAL")
+
+# %% [markdown]
+# ## 9. Limitations & Ethics
+#
+# - **Where it fails.** See section 7.
+#   - Small models still pick the wrong figure from a passage: the wrong year, the wrong line item, or thousands
+#     read as millions. The calculator removes arithmetic slips but not extraction slips. The Program-of-Thoughts
+#     error analysis found the same.
+#   - Retrieval misses happen when a question says only "the company" and the passage words things differently.
+#   - Without the ticker filter, answers can silently come from another company.
+# - **Data limits.** The Q&A pairs were generated by an LLM from one 2023 10-K per company: 69 mostly large US
+#   companies. About 50 gold answers state facts that are not in their passage (the "unexplained" bucket, 3.4).
+#   The derived calculation questions are synthetic, although every gold value is computed by code and checked by a
+#   teammate. Results may not transfer to full filings, other years, tables, or smaller companies.
+# - **Who could be harmed.** An analyst or investor who trusts a confidently stated but wrong figure. Every answer
+#   cites its passage so it can be checked. The system is a reading aid, **not financial advice**.
+# - **Security.** The calculator runs model-written code. The allow-list and the separate process stop imports,
+#   file access and hangs, but this is not an OS-level sandbox, and a production system would need containers.
+#   Retrieved passages could carry prompt-injection text; we treat passage text only as data in the prompt, but a
+#   4B model can still be steered by it.
+# - **Privacy and misuse.** 10-K filings are public, and no personal data is processed. The same pipeline could be
+#   used to produce authoritative-looking but wrong financial summaries at scale, which is another reason the
+#   citation is part of every answer.
+# - **Evaluation limits.** The judge is a small LLM, checked against human labels (6.1). Numeric matching uses a
+#   1% tolerance, ignores the sign, and cannot check the scale when the gold answer has none (a gold "$1.60" is
+#   matched by "$1.60 billion"). Full-test-set numbers come from cached runs (4.1).
+
+# %% [markdown]
+# ## 10. References
+#
+# - **Dataset:** `virattt/financial-qa-10K` (Hugging Face), revision `30e48b49ef40389cce6488b0bddef7d6f00f4c7a`.
+# - **Models:**
+#   - Qwen3-4B-Instruct-2507 (`qwen3:4b-instruct` in Ollama), the agent and baselines.
+#   - Phi-4-mini-instruct (`phi4-mini`), the judge and the derived-question generator.
+#   - BAAI/bge-small-en-v1.5 and sentence-transformers/all-MiniLM-L6-v2 (embeddings).
+#   - cross-encoder/ms-marco-MiniLM-L-6-v2 (re-ranker).
+# - **Papers:**
+#   - Yao et al. 2023, *ReAct*.
+#   - Chen et al. 2023, *Program of Thoughts Prompting*.
+#   - Gao et al. 2023, *PAL*.
+#   - Wang et al. 2023, *Self-Consistency*.
+#   - Chen et al. 2021, *FinQA*.
+#   - Zhu et al. 2021, *TAT-QA*.
+#   - Islam et al. 2023, *FinanceBench*.
+#   - Cormack et al. 2009, *Reciprocal Rank Fusion*.
+#   - Robertson & Zaragoza 2009, *BM25*.
+#   - Xiao et al. 2023, *C-Pack / BGE*.
+#   - Zheng et al. 2023, *Judging LLM-as-a-Judge*.
+# - **Course labs reused:**
+#   - Module 2 `4_Structured_Generation_Lab` (PAL / program-of-thought, self-consistency, schema-constrained
+#     output).
+#   - Module 3 `1_RAG_Pipeline_Lab` (BM25, RRF, cross-encoder re-ranking, Recall@k / MRR).
+#   - Module 4 `1_Multi_Agent_System_End_to_End` and `Agentic_app` (tools, `run_python`, the ReAct graph, the
+#     require-a-tool nudge, `check_setup.py`).
+#   - Module 4 MCP lab (the AST calculator idea).
+# - **Tools:** Ollama, LangGraph, LangChain, FAISS, rank-bm25, sentence-transformers, Hugging Face `datasets`,
+#   pandas, matplotlib, jupytext.
+# - **AI assistance:** <!-- TODO(Vyom): write the AI-assistance disclosure required by the course Integrity rule -->
+#   *to be written by the team.*
