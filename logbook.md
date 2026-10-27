@@ -37,3 +37,79 @@ An append-only, timestamped record of every atomic change made to this project. 
 - 2026-10-28 02:53:34 +0530 | Claude | DECISION: judge | The judge is now `phi4-mini` with the B_strict prompt, replacing `gemma3:4b`. It is a different family from the Qwen agent and scored 20/20 on the probe. qwen3:4b-instruct also scored 20/20 but was not used, because it is the agent model and would risk favouring its own answers.
 - 2026-10-28 02:53:34 +0530 | Claude | `check_setup.py`, `README.md`, `PLAN.md`, `PROGRESS.md` | Applied the judge change: the default `JUDGE_MODEL` is `phi4-mini`; the judge check uses the strict rubric (`JUDGE_TEMPLATE`); the README pulls phi4-mini (models now about 5 GB); PLAN.md D8, the metrics, Colab and P0 lines are updated with a change note; PROGRESS.md decisions and open items are updated, and removing the probe-only models (gemma3:4b, llama3.2:3b) is listed as needing Vyom's consent.
 - 2026-10-28 02:54:52 +0530 | Claude | smoke test | Re-ran `python check_setup.py`: all checks pass, including the phi4-mini judge (YES on the match, NO on the wrong number). **P0 is done.** PROGRESS.md has the P0 status, environment notes and the notebook build commands.
+- 2026-10-28 02:57:00 +0530 | Claude | P1 data exploration (scratchpad scripts) | Findings:
+  - Rows: 7000. Empty fields: 2 questions, 2 answers, 1 context. Exact duplicate rows: 7. Duplicate questions within a ticker: 49.
+  - Tickers: 69 (68 with 100 rows each; JNJ has 200 rows, 187 distinct contexts and only 1 duplicate row, so it is not a duplicated batch).
+  - Contexts: 6753 unique after normalisation; 6 are shared across tickers; 167 same-ticker pairs where one context contains another.
+  - Context length: median 27 words, p99 120, max 787; only 2 contexts are over about 512 tokens, so no chunking is needed (D1).
+  - Some contexts are garbled text or flattened table rows.
+  - A naive "answer number not in context" rule flags 147 rows, but most are presentation differences: thousands-scale tables, sign conventions ("decreased 34.7%" vs "-34.7%"), dates, section refs like "10(b)", list markers "1)", or numbers the gold answer invents.
+- 2026-10-28 02:59:36 +0530 | Claude | DECISION: question tagging | Deterministic rules with arithmetic verification replace the plan's "keyword regex + LLM tagger":
+  - `text_lookup`: the answer has no non-date numbers.
+  - `numeric_lookup`: every answer number appears in the context or question, allowing a 1000^k scale change, sign and 0.5% rounding.
+  - `calculation`: every new answer number can be reproduced by one operation on two context numbers (difference, sum, ratio, ratio×100, percent change), within 1% or rounded to the precision shown.
+  - `unexplained`: anything else (usually a gold answer with facts not in the passage); excluded from the test sets and reported.
+  - Prototype counts on the cleaned data: 3472 text_lookup / 3427 numeric_lookup / 48 calculation / 50 unexplained. Spot checks show most calculation tags are right, with a few coincidental matches on invented gold answers, so teammate A verifies all 48 real calculation items.
+  - Why: the label is reproducible, it checks the gold answer as a side effect, and it needs no LLM calls.
+- 2026-10-28 02:59:36 +0530 | Claude | dataset pin | The dataset is pinned to the Hugging Face commit `30e48b49ef40389cce6488b0bddef7d6f00f4c7a` (last modified 2024-05-31) for reproducible reruns.
+- 2026-10-28 03:01:40 +0530 | Claude | `P03_Financial_10K_Analyst.py` §2–§3.4 | Added:
+  - §2 Setup: pinned `%pip` line, seeds, flags (`QUICK_RUN`, `USE_CACHED_PREDS`, `REBUILD_DERIVED`), CONFIG with the dataset revision and environment overrides, the Colab Ollama bootstrap, a check that Ollama is reachable and both models are pulled (raises if not), and the `get_llm` and `JsonlStore` (resumable JSONL) helpers.
+  - §3.1 Cleaning and exploration: length table and 3 histograms.
+  - §3.2 Knowledge base: (ticker, normalised passage) gives `doc_id` D00000…; same-ticker containment gives `relevant_docs`; token counts against the 512-token window.
+  - §3.3 Number parser: scale, sign and precision handling, with asserts.
+  - §3.4 Question-type tagging.
+  - Ran it as a script and it passes. Cleaned rows: 6990 (3 empty, 7 duplicates). Documents: 6756; 104 have a near-duplicate; 136 questions have more than one relevant passage; 2 are over 512 tokens. Types: 3470 text_lookup / 3422 numeric_lookup / 48 calculation / 50 unexplained.
+- 2026-10-28 03:03:30 +0530 | Claude | derived-question prototype (scratchpad) | phi4-mini with structured output on 12 passages: 7 ok, 4 rejected for invented operands, 1 rejected because the result was already stated. Some "ok" items were nonsense (sum of a postal code and a phone area code; sum of page numbers). Fixed in the notebook version: passages need at least 2 money amounts (a `$` sign or a scale word), and the prompt forbids page, date, address, phone and note numbers.
+- 2026-10-28 03:04:42 +0530 | Claude | `P03_Financial_10K_Analyst.py` §3.5–§3.7 | Added:
+  - §3.5 Human checks: three exports written once and never overwritten (`qtype_sample_to_label.csv` with 100 blind stratified rows: 40 text, 35 numeric, 15 calc, 10 unexplained; `real_calc_to_verify.csv`; `derived_calc_to_verify.csv`). The completed files are read if present, giving agreement, κ and a crosstab; otherwise the notebook prints PENDING.
+  - §3.6 Derived questions: the `DerivedQuestion` pydantic schema, `DERIVE_PROMPT`, the `check_derived` validator, and the gold value and text computed in Python. Results go to the resumable `artifacts/derived/derived_calc_raw.jsonl`. The `GENERATE_DERIVED` flag (environment override) must be on to call the LLM, otherwise the notebook raises.
+  - §3.7 Splits: test is 100+100 lookup, all real calc, and derived minus 20; dev is 15+15+20 derived; quick is 10 per type. Ids go to `artifacts/splits.json`; `gold_numbers` are kept per question for the numeric metric.
+- 2026-10-28 03:04:42 +0530 | Claude | run | Started the notebook-source run with `GENERATE_DERIVED=1` (about 180 phi4-mini calls) in the background.
+- 2026-10-28 03:06:30 +0530 | Claude | `P03_Financial_10K_Analyst.py` §5a | Added retrieval, adapted from Module 3 lab functions and `Agentic_app/rag.py`:
+  - `DenseIndex` (FAISS IndexFlatIP over normalised embeddings, cached to `artifacts/cache/emb_*.npy`, ticker filter via `IDSelectorBatch`; checked first that FAISS 1.15.1 returns -1 for unused slots) for bge-small with its query prefix and for MiniLM.
+  - BM25 with a tokenizer that keeps numbers whole, ticker-masked; `rrf_fuse` (k=60) keyed on rows; cross-encoder `rerank` of the top 20; `retrieve(method=dense|bm25|hybrid|hybrid_rerank)`.
+  - Evaluation grid: 5 retrievers × ticker filter on/off, with R@{1,3,5,10}, MRR@10 and ms/query, a Recall@k chart, a filter on/off bar chart, and R@5 by question type.
+- 2026-10-28 03:09:17 +0530 | Claude | `P03_Financial_10K_Analyst.py` §5b (sandbox) | Added the `run_python` tool:
+  - An AST allow-list (`check_sandbox_code`; attributes limited to `math.x`, no dunders, only allow-listed calls, exponents limited to a constant ≤100 or a variable).
+  - `prepare_code` strips code fences and thousands separators and rewrites the last expression to `answer`. Code runs in a `python -I -X utf8` subprocess with a 5 s timeout; errors come back as text.
+  - 14 asserted cases pass when the cell is run on its own (scratchpad `run_cells.py` helper). They cover comma literals, f-string print, math.sqrt, import/open/dunder/while blocked, the `range(10**12)` timeout, ZeroDivisionError, `10**10**8` rejected, and `x**3`.
+  - Fixed before the first run: the built-ins lookup, missing `ast.Pass`, nested-power bypass, and a Windows encoding mismatch (`-X utf8`).
+- 2026-10-28 03:11:06 +0530 | Claude | `P03_Financial_10K_Analyst.py` §5b (search tool + agent) | Added:
+  - **`make_search_tool`** (`search_filings(query, ticker="")`): output formatted as `[Dxxxxx | TICKER] text` with passages capped at 2000 characters; the session ticker is the default; an unknown ticker returns an error listing the valid ones; an exact repeated query is refused; the filter-off mode ignores tickers.
+  - **Context window:** CONFIG `agent_num_ctx=8192`, so Ollama does not silently truncate long agent prompts. `get_llm` now takes a `seed` argument (for self-consistency).
+  - **Agent graph:** `AgentState` (messages, steps, nudges); nodes `agent`, `tools` (ToolNode, handle_tool_errors=True), `finalize` (no tools, at MAX_STEPS=6) and `guard` (nudges to search first, up to 2 times, and a once-only calculator nudge when the draft has a number that is in no passage and run_python was never used). `recursion_limit` is the backstop.
+  - **Prompt:** `system_prompt(calculator)` with rules and a worked example using an invented company (ACME, D99999), so no test leakage.
+  - **`run_agent`:** returns the answer, cited_doc, tool_calls, retrieved_docs, tool_errors, llm_calls, nudges, steps, tokens, latency and trace; the graph is drawn with `draw_mermaid()`. Not executed yet.
+- 2026-10-28 03:12:54 +0530 | Claude | run result (derived v1) | The background run finished (exit 0). Derived v1: 180 candidates from 774 eligible passages; 139 ok, 28 rejected because the result was already stated, 9 for a non-verbatim operand, 3 for a parse failure, 1 for identical operands. Splits: test 367 (100 text, 100 numeric, 48 calc, 119 derived), dev 50, quick 40. Exports written: `qtype_sample_to_label.csv` (100) and `real_calc_to_verify.csv` (48).
+- 2026-10-28 03:13:30 +0530 | Claude | derived v1 quality review | Four problems found:
+  1. 130 of the 139 were "difference" questions.
+  2. The gold text lost precision ($1.0B − $43.8M was written as "$1.0 billion").
+  3. Swapped operands gave a negative "increase" (-$420M).
+  4. Mixed currencies were accepted (€5 billion − $33.5 million).
+- 2026-10-28 03:14:40 +0530 | Claude | `P03_Financial_10K_Analyst.py` §3.6, §4.1 | Fixes:
+  - Round-robin requested operation (`OP_CYCLE`, kept as `requested_operation`); 250 candidates.
+  - difference = |a−b|; `fmt_amount` steps the scale down when the result is below one unit.
+  - difference and sum require the same kind of operand (pct, dollar).
+  - Derived qids are stable (`x<doc digits>_<sha1(question)[:6]>`); results go to `derived_calc_raw_v2.jsonl`; the operation mix is displayed.
+  - Cache safety: `run_condition` stores the question text and raises on a mismatch; the judge store keeps the judged answer and raises on a mismatch.
+  - Also added §4 (harness: `eval_q`, `live_allowed`, `run_condition`, `JUDGE_TEMPLATE` and `judge_condition`, `numeric_correct` with asserts, `score`, `answer_from_llm`; B0 closed-book).
+- 2026-10-28 03:14:40 +0530 | Claude | artifacts (removed own files) | Deleted `artifacts/derived/derived_calc_raw.jsonl` and `artifacts/labels/derived_calc_to_verify.csv`. Both were Claude-generated v1 outputs from 03:12, never labelled and superseded by v2, which the deletion rule allows for Claude's own files. The `qtype_sample_to_label.csv` and `real_calc_to_verify.csv` exports are unchanged and kept.
+- 2026-10-28 03:15:00 +0530 | Claude | run | Started a background rerun with `GENERATE_DERIVED=1`: derived v2 (250 candidates), B0 on the quick subset, the retrieval grid, and the tool cells.
+- 2026-10-28 03:15:46 +0530 | Claude | `P03_Financial_10K_Analyst.py` §5b–§6 | Added:
+  - `show_trace` and an agent check on dev (2 questions per type, live, with traces and a summary table).
+  - §5c (fine-tuning not required).
+  - §6: `RAG_PLAIN` (adapted from the Module 3 RAG_PROMPT) and `RAG_COT` prompts, `rag_answer`, `parse_final` (last Answer/Source), and the `CONDITIONS` B0/B1/B2/S/A1/A2, each run through `run_condition` and scored.
+  - `summarize`, giving one results table (judge accuracy overall and per type, numeric accuracy on calc, calculator use on calc and lookup, gold-passage retrieval, citation accuracy, s/q, LLM calls/q, tokens/q, missing verdicts), plus a judge-accuracy-by-type bar chart.
+  - None of this has run yet: it was added while the 03:15 run was in progress.
+- 2026-10-28 03:34:22 +0530 | Claude | run result (derived v2, B0, retrieval) | Exit 0.
+  - **Derived v2:** 250 candidates, 195 ok. Operations: 146 difference / 37 sum / 7 ratio / 5 share / **0 percent_change**, because phi4-mini ignored the requested operation (percent_change came back as difference 49/50 times).
+  - **Splits:** test 423 (100/100/48/175), dev 50, quick 40.
+  - **B0 on the quick subset (raw phi4-mini judge, before the gates):** text 0.4, numeric 0.6, calc 0.2, derived 0.1.
+  - **Retrieval grid (test, n=423):** hybrid+rerank with the filter scores R@1 0.870, R@10 0.988, MRR 0.920, about 75 ms/query. With the filter off: R@1 0.757, R@10 0.924, MRR 0.820. Dense bge (filter on): R@1 0.830, MRR 0.886. MiniLM: R@1 0.827, MRR 0.881. BM25: R@1 0.809, MRR 0.867. Hybrid without rerank: R@1 0.830, MRR 0.888. R@5 for hybrid+rerank with the filter, by type: calc 0.979, derived 1.000, numeric 0.970, text 0.960.
+  - **Tools:** the search tool output, the unknown-ticker error and the repeat-query refusal behave as intended; the graph mermaid is drawn.
+- 2026-10-28 03:36:00 +0530 | Claude | judge dev check (Claude's own dev labels, NOT the human validation) | Claude labelled all 40 B0 quick answers by hand: only about 3–4 are actually correct (COST ticker, COSO framework, estimates). The phi4-mini judge said YES to 13: 3 refusals ("no 10-K for DVA", Home Depot, Caterpillar), 2 wrong figures ($138.0M vs gold $132.4M; $138.3M vs gold $3,518,543 thousand), and about 5 wrong text answers. Conclusion: the judge alone is lenient on real answers, and the 20-case probe did not show it.
+- 2026-10-28 03:38:30 +0530 | Claude | `P03_Financial_10K_Analyst.py` §3.6 (derived v3), §3.7, §4.1 | Changes:
+  - **Derived generation, forced operation:** `OP_SPEC` (definition, example phrasing, required wording per operation); `derived_schema(op)` fixes `operation` to one `Literal` value; `check_derived` rejects questions whose wording does not match the operation; `generate_derived`; output goes to `derived_calc_raw_v3.jsonl`. The definitions and run cells are split. A scratchpad test on 15 passages (3 per operation) accepted 12/15, covering all 5 operations.
+  - **Saved questions:** the question table is saved to `artifacts/questions.jsonl`.
+  - **Judge = rule gates + LLM:** a refusal (`REFUSAL_RE`, with asserts) means incorrect; calculation questions require `numeric_correct`; numeric lookups require at least one gold figure; then phi4-mini. The cache stores the raw LLM verdict; `JUDGE_VERSION="strict-v1"` is in the cache filename; `score` adds `refusal`, `llm_judge_ok`, `judge_ok` and `fail_reason`; `summarize` adds a refusal rate.
+- 2026-10-28 03:39:36 +0530 | Claude | artifacts (removed own files) | Deleted Claude-generated, unlabelled, superseded files: `derived_calc_raw_v2.jsonl`, `labels/derived_calc_to_verify.csv` (v2 export), and the B0 preds and judge files from 03:30 (unversioned judge filename; cheap to regenerate, 40+40 calls). Kept: the embedding caches, `qtype_sample_to_label.csv`, `real_calc_to_verify.csv`.

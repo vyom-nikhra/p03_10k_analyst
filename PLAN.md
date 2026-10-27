@@ -104,11 +104,12 @@ This is the course group project for UG3/UG4 GenAI, Modules 1–4. The goal is a
 - **Deduplication:** normalise each context (lowercase, collapse whitespace) and assign a `doc_id`.
   - Near-duplicates (one context contains the other, or they are equal after normalisation) form a **relevant set** for each question, so duplicates don't make Recall look worse than it is.
   - Report how many near-duplicates there are.
-- **Question type**, with 3 classes: `text_lookup`, `numeric_lookup` and `calculation`:
-  1. **Rule A:** the gold answer contains a number that is not in the context after normalisation, so it must have been calculated → `calculation`.
-  2. **Rule B:** the answer contains numbers, and all of them appear in the context → `numeric_lookup`.
-  3. **Rule C:** a keyword regex on the question (percentage / ratio / change / difference / total…) flags conflicts, which an LLM tagger resolves.
-  4. A teammate hand-labels 100 rows; report how well the rules agree with them.
+- **Question type** (*updated 2026-10-28 after data exploration; see logbook*). The rules are deterministic, using a parser that understands scale and sign and ignores dates:
+  1. **`text_lookup`:** the answer contains no non-date numbers.
+  2. **`numeric_lookup`:** every answer number appears in the context or question, up to presentation (a 1000^k scale change, the sign, or rounding).
+  3. **`calculation`:** every new answer number can be reproduced by **one arithmetic operation on two context numbers** (difference, sum, ratio, ratio×100, percent change). The check also verifies the gold answer. Prototype count: 48.
+  4. **`unexplained`:** anything else, usually a gold answer with facts not in the passage. These rows are excluded from the test sets and reported (50).
+  5. **Human check:** a teammate labels 100 stratified rows without seeing the rule's tag, and we report agreement and κ. Teammate A also verifies all real calculation items.
   - The tags use the answer, so they are **for evaluation only**; the agent never sees them.
 - **Derived calculation set ("10K-Calc", about 150 candidates, keeping the hand-verified ones):**
   1. A regex finds contexts with 2 or more comparable figures (the same unit, or year pairs).
