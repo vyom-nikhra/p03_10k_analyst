@@ -82,7 +82,7 @@ This is the course group project for UG3/UG4 GenAI, Modules 1–4. The goal is a
 | D5 | Calculator sandbox | Separate process (`python -I`) with a 5 s timeout and an **AST allow-list**. `print`, `round` and `math` are allowed, and stdout is captured. | The Module 4 in-process `exec` with a list of banned substrings | Sandbox unit tests. The lab version hangs on `while True`, rejects the name `evaluation`, and turns `1,234` into a tuple. |
 | D6 | Control flow | ReAct agent in LangGraph | Fixed pipelines: RAG → answer; RAG + CoT; RAG → single-shot program of thought | Results table by question type |
 | D7 | Agent LLM | **`qwen3:4b-instruct` (Qwen3-4B-Instruct-2507)** | Justified in writing; no bake-off (Vyom's call) | Reasons listed under the table |
-| D8 | Judge | **`gemma3:4b`**: a different family, so less self-preference. Binary rubric; numbers checked by rule first. | Exact match / last-number regex (the Module 2 style) | Agreement % and Cohen's κ (agreement corrected for chance) against about 60 human-labelled answers |
+| D8 | Judge | **`phi4-mini`** (3.8B, Microsoft; *changed from `gemma3:4b` on 2026-10-28 after the P0 probe, see logbook*): a different family, so less self-preference. Strict binary rubric; numbers checked by rule first. Probe on 20 cases: phi4-mini 20/20, qwen3:4b-instruct 20/20 (but it is the agent model), gemma3:4b 15–17/20, llama3.2:3b 10–14/20. | Exact match / last-number regex (the Module 2 style) | Agreement % and Cohen's κ (agreement corrected for chance) against about 60 human-labelled answers |
 
 **D7, why `qwen3:4b-instruct`:**
 - **Size and family:** the exact family and size the brief names (4.0B), so no exception is needed.
@@ -194,7 +194,7 @@ Every condition runs on the same fixed test sets. Results are reported **by type
 **Metrics**
 - **Retrieval on its own:** Recall@k and MRR.
 - **In-system recall:** the gold document appeared in any `search_filings` result during the agent's run.
-- **Judge accuracy:** from `gemma3:4b`, checked against human labels.
+- **Judge accuracy:** from `phi4-mini`, checked against human labels.
 - **Numeric match (numeric and calculation questions):** adapted from PoT `finqa_equal`, with 1% relative tolerance, ×100/÷100 accepted, and scale normalisation.
 - **Calculator-call rate:** for calculation questions, read from `AIMessage.tool_calls`. Also report unnecessary calls on lookup questions.
 - **Citation accuracy:** the cited document is in the gold relevant set.
@@ -238,12 +238,12 @@ Every condition runs on the same fixed test sets. Results are reported **by type
   - pinned `%pip install`
   - `OLLAMA_HOST` read from the environment, defaulting to `http://localhost:11434`
   - an environment check cell: Ollama reachable and its version, the required models pulled, GPU, Python version
-  - on Colab only (`IN_COLAB`): install Ollama with curl, start `ollama serve` in the background, then `ollama pull qwen3:4b-instruct gemma3:4b`
+  - on Colab only (`IN_COLAB`): install Ollama with curl, start `ollama serve` in the background, then `ollama pull qwen3:4b-instruct` and `ollama pull phi4-mini`
 - **No machine-specific code:** `pathlib` paths relative to the notebook; the device is detected automatically; no shell-specific cell magics outside the Colab branch.
 - **Versions:**
   - Python 3.11 or 3.12, matching Colab. This machine has 3.13.5, so use a 3.12 venv if any wheel fails.
   - **Update Ollama:** this machine has 0.14.3.
-- **Model sizes:** `qwen3:4b-instruct` (about 2.5GB) and `gemma3:4b` (about 3.3GB) fit together in 8GB. On the 4GB laptop they swap, which is fine because judging is a separate pass.
+- **Model sizes:** `qwen3:4b-instruct` (about 2.5GB) and `phi4-mini` (about 2.5GB) fit together in 8GB. On the 4GB laptop they swap, which is fine because judging is a separate pass.
 
 ## 8. Notebook map (template order; each section cites the lab it reuses)
 | § | Contents |
@@ -281,7 +281,7 @@ Every condition runs on the same fixed test sets. Results are reported **by type
 ## 9. Phases (minimum viable version first; fit to the deadline later)
 | Phase | Work | MVP or stretch |
 |---|---|---|
-| P0 | Repo (`git init`, local author config `Vyom Nikhra`), venv, pinned requirements, Ollama update and model pulls, a tool-calling smoke test of `qwen3:4b-instruct`, a judge smoke test of `gemma3:4b` | MVP |
+| P0 | Repo (`git init`, local author config `Vyom Nikhra`), venv, pinned requirements, Ollama update and model pulls, a tool-calling smoke test of `qwen3:4b-instruct`, a judge smoke test (judge now `phi4-mini`) | MVP |
 | P1 | §0–3: load, explore, clean, deduplicate, tag 3 types, build the derived 10K-Calc candidates, splits | MVP |
 | P1b | *Teammates, in parallel with P2–P4:* verify the derived items, hand-label 100 type tags | MVP |
 | P2 | §5a retrieval + standalone Recall/MRR grid | MVP |
@@ -316,7 +316,7 @@ Vyom covers retrieval, tools, the agent and the demo. Each teammate also runs `Q
 
 **To check in P0, not assumed:**
 - whether `ChatOllama` needs or rejects `reasoning=False` for a model with no thinking mode
-- that the Ollama tags `qwen3:4b-instruct` and `gemma3:4b` exist on the updated Ollama
+- that the Ollama tags `qwen3:4b-instruct` and the judge model exist on the updated Ollama (confirmed in P0)
 
 ## 12. Verification (before anything is called done)
 - The tool and parser unit-test cell passes.

@@ -1,0 +1,4 @@
+-r requirements.txt
+ipykernel==7.4.0
+nbconvert==7.17.2
+jupytext==1.19.6
