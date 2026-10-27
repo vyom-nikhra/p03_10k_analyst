@@ -1,6 +1,8 @@
 # P03 Financial 10-K Analyst: Progress Log
 
-Read this first when resuming. The full design is in `PLAN.md`.
+Read this first when resuming, then the tail of `logbook.md` for the latest atomic changes. The full design is in `PLAN.md`.
+
+Every change to the project gets a timestamped line in `logbook.md` as soon as it is made.
 
 ## Status
 | Phase | Work | Status |
