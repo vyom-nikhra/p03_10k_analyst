@@ -29,6 +29,8 @@ Every change to the project gets a timestamped line in `logbook.md` as soon as i
 ## Open items
 - [ ] Timeline: fit the phases to the deadline.
 - [x] Which machine runs P0: the planning laptop (Vyom, 2026-10-28). Large runs go to the RTX 4070 laptop on request.
+- [x] Full test-set run: on the RTX 4070, run by Vyom, preferably after the teammates' derived/real calculation verification (Vyom, 2026-10-28). Step-by-step checklist in the README ("Full evaluation run").
+- [ ] P8: choose the submitted notebook's default flags. Options: `QUICK_RUN=0` + `USE_CACHED_PREDS=1`, which shows full-test results re-scored from the saved predictions; or the current default `QUICK_RUN=1`, which shows the quick subset only.
 - [ ] Instructor: do cached predictions count as "saved artefacts" for the 60-minute rule?
 - [ ] Vyom: wording of the AI-assistance disclosure in §10 (required by the course Integrity rule).
 - [x] Checked in P0: `qwen3:4b-instruct` and `phi4-mini` pull and run on Ollama 0.40.11; `ChatOllama(reasoning=False)` is accepted by qwen3:4b-instruct.

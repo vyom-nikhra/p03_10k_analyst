@@ -88,13 +88,32 @@ Flags are set at the top of the notebook, or with environment variables of the s
 | `USE_CACHED_PREDS` | `1` | With `QUICK_RUN=0`, scores the full test set from saved predictions in `artifacts/preds/`, with no live LLM runs. |
 | `GENERATE_DERIVED` | `0` | Lets the LLM generate missing derived calculation questions. |
 
-**Full evaluation run** (several hours; meant for the RTX 4070 laptop). It resumes where it stopped if interrupted.
+**Full evaluation run** (meant for the RTX 4070 laptop). It resumes where it stopped if interrupted.
 
-PowerShell:
-```
-$env:QUICK_RUN="0"; $env:USE_CACHED_PREDS="0"
-python -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 P03_Financial_10K_Analyst.ipynb
-```
+Expected time, estimated from quick-run timings: about 9 hours on the 4 GB planning laptop, where the model runs half on the CPU. On the RTX 4070 it should be roughly 3–4 hours.
+
+1. **Copy the repo** to the RTX 4070 laptop, including `artifacts/`; `artifacts/cache/` is rebuilt on first use. There is no git remote yet, so copy the folder, or use a bundle:
+   ```
+   git bundle create p03.bundle --all
+   git clone p03.bundle p03_10k_analyst
+   ```
+2. **Set up** with steps 1–4 above. `python check_setup.py` must pass.
+3. **Add the verification files first** (recommended). Put the teammates' `derived_calc_verified.csv` and `real_calc_verified.csv` in `artifacts/labels/`. Rejected items are then dropped before the run, so no time is spent on them. Running without the files also works: predictions for items rejected later are simply ignored.
+4. **Run it with the venv activated.** The `python3` Jupyter kernel starts whatever `python` is first on PATH.
+
+   PowerShell:
+   ```
+   $env:QUICK_RUN="0"; $env:USE_CACHED_PREDS="0"
+   python -m jupytext --to ipynb P03_Financial_10K_Analyst.py
+   python -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 P03_Financial_10K_Analyst.ipynb
+   ```
+5. **Commit the results** and bring them back the same way:
+   - `artifacts/preds/`
+   - `artifacts/judge/`
+   - `artifacts/labels/failures_to_categorize__test.csv`
+   - the executed notebook
+
+   After that, `QUICK_RUN=0` with `USE_CACHED_PREDS=1` re-scores the full test set from these files with no live model runs.
 
 ## Human labelling (teammates)
 The notebook exports the files below to `artifacts/labels/`. Fill one in and save it under its "completed" name; the notebook picks it up on the next run. Exports are never overwritten.
