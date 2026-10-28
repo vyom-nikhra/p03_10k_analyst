@@ -594,11 +594,9 @@ derived.insert(0, "qid", [f"x{d[1:]}_{hashlib.sha1(q.encode()).hexdigest()[:6]}"
 display(derived.operation.value_counts().rename("derived questions").to_frame())
 export_once(derived[["qid", "ticker", "question", "operation", "operand_a", "operand_b", "gold_answer", "context"]]
             .assign(verified="", note=""), "derived_calc_to_verify.csv")
-derived_ok = read_verified("derived_calc_verified.csv", "qid")
-if derived_ok is not None:
-    derived = derived[derived.qid.isin(derived_ok)].reset_index(drop=True)
-print(f"derived calculation questions: {len(derived)} "
-      f"({'pending human verification' if derived_ok is None else 'human-verified'})")
+derived_ok = read_verified("derived_calc_verified.csv", "qid")    # applied in 3.7, after the split assignment
+print(f"derived calculation questions passing the automatic checks: {len(derived)}; human-verified: "
+      f"{'pending' if derived_ok is None else len(derived_ok & set(derived.qid))}")
 display(derived[["question", "operation", "operand_a", "operand_b", "gold_answer"]].head(5))
 
 # %% [markdown]
@@ -611,6 +609,9 @@ display(derived[["question", "operation", "operand_a", "operand_b", "gold_answer
 # | test | 100 `text_lookup` + 100 `numeric_lookup` + **all** real `calculation` questions + all derived questions except 20 |
 # | dev | 15 `text_lookup` + 15 `numeric_lookup` + 20 derived questions. No real calculation question is used for dev, so all of them stay in test. |
 # | quick | 10 test questions per type. Used live when `QUICK_RUN = True`. |
+#
+# Calculation items that a teammate marks as wrong (3.5, 3.6) are removed **after** this assignment. A rejected
+# item therefore never pulls another question from dev into test; the type just has fewer questions.
 
 # %%
 def real_rows(frame, kind):
@@ -625,10 +626,7 @@ for kind in ("text_lookup", "numeric_lookup"):
     pick = df[df.qtype == kind].sample(n_dev + n_test, random_state=SEED)
     parts += [real_rows(pick.iloc[:n_dev], kind).assign(split="dev"),
               real_rows(pick.iloc[n_dev:], kind).assign(split="test")]
-calc = df[df.qtype == "calculation"]
-if real_calc_ok is not None:
-    calc = calc[calc.qid.isin(real_calc_ok)]
-parts.append(real_rows(calc, "calculation").assign(split="test"))
+parts.append(real_rows(df[df.qtype == "calculation"], "calculation").assign(split="test"))
 der = pd.DataFrame({"qid": derived.qid, "source": "derived", "ticker": derived.ticker, "question": derived.question,
                     "gold_answer": derived.gold_answer, "qtype": "derived_calculation", "gold_doc": derived.doc_id,
                     "relevant_docs": derived.doc_id.map(lambda d: sorted(related[d]))})
@@ -651,10 +649,19 @@ for kind, g in questions[questions.split == "test"].groupby("qtype"):
     quick_ids |= set(g.sample(min(CONFIG["n_quick_per_type"], len(g)), random_state=SEED).qid)
 questions["quick"] = questions.qid.isin(quick_ids)
 
+# Items a teammate rejected are dropped only now, after dev/test/quick were assigned, so verification never moves a
+# question between dev and test.
+keep = pd.Series(True, index=questions.index)
+for kind, ok in (("calculation", real_calc_ok), ("derived_calculation", derived_ok)):
+    if ok is not None:
+        keep &= (questions.qtype != kind) | questions.qid.isin(ok)
+print(f"dropped {int((~keep).sum())} items that failed human verification")
+questions = questions[keep].reset_index(drop=True)
+
 (ART / "splits.json").write_text(json.dumps({s: sorted(g.qid) for s, g in questions.groupby("split")}, indent=1))
 questions.to_json(ART / "questions.jsonl", orient="records", lines=True, force_ascii=False)
 display(pd.crosstab(questions.qtype, questions.split, margins=True))
-print(f"quick subset: {len(quick_ids)} questions")
+print(f"quick subset: {int(questions.quick.sum())} questions")
 
 # %% [markdown]
 # ## 4. Baseline
@@ -683,7 +690,8 @@ print(f"quick subset: {len(quick_ids)} questions")
 #   On real answers the LLM judge alone said YES to refusals and to wrong figures, such as "$138.0M" against a gold
 #   "$132.4M" (dev check, logbook 2026-10-28). That is why the rule checks run first. Section 6 validates the
 #   combined verdict against human labels.
-# - **Numeric accuracy** (calculation questions): every gold number must appear in the answer within 1%. Answers
+# - **Numeric accuracy** (calculation questions): every gold number must appear in the answer within 1%, either at
+#   its exact value or as rounded in the gold answer text (exact 0.963%, gold "1.0%", answer "1%"). Answers
 #   written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`. The scale (thousand / million / billion)
 #   is checked only when both the answer and the gold state one: "$1,318 million" matches a gold "$1,318.0" taken
 #   from a table in millions. The sign is ignored, because answers phrase decreases in words.
@@ -699,7 +707,7 @@ display(eval_q.qtype.value_counts().rename("questions").to_frame())
 
 # Bump a version whenever that system's prompt or code changes. It is part of the cache file name, so predictions
 # made by an older version are never reused.
-BASELINE_VERSION, AGENT_VERSION = "v1", "v1"
+BASELINE_VERSION, AGENT_VERSION = "v1", "v3"
 
 
 def live_allowed(kind):
@@ -769,10 +777,12 @@ def judge_condition(name, preds, qs=None):
 
 
 def numeric_correct(answer, gold_numbers, gold_answer):
-    """Every gold number appears in `answer` within 1%. A gold answer with no scale word (e.g. "$1,318.0" from a
-    table in millions) does not fix the scale, so then the answer's scale is not checked either."""
+    """Every gold number appears in `answer` within 1%, either at its exact value or as rounded in the gold answer
+    (exact 0.963, gold text "1.0%", answer "1%"). A gold answer with no scale word (e.g. "$1,318.0" from a table in
+    millions) does not fix the scale, so then the answer's scale is not checked either."""
     preds = extract_numbers(answer)
-    gold_unscaled = not any(n["scaled"] for n in extract_numbers(gold_answer))
+    gold_shown = extract_numbers(gold_answer)
+    gold_unscaled = not any(n["scaled"] for n in gold_shown)
 
     def hit(g):
         g = abs(g)
@@ -784,13 +794,18 @@ def numeric_correct(answer, gold_numbers, gold_answer):
                 return True
         return False
 
-    return all(hit(g) for g in gold_numbers) if gold_numbers else None
+    def matched(g):
+        rounded = [n["value"] for n in gold_shown if math.isclose(abs(n["value"]), abs(g), rel_tol=0.05)]
+        return hit(g) or any(hit(r) for r in rounded)
+
+    return all(matched(g) for g in gold_numbers) if gold_numbers else None
 
 
 assert numeric_correct("It grew by $5,606 million.", [5.606e9], "$5.6 billion") and numeric_correct("about 30.8%", [31.0], "31%")
 assert not numeric_correct("It grew by $5.6 billion and 12%.", [8.548e9], "$8.5 billion")
 assert numeric_correct("Services were 0.125 of revenue", [12.5], "12.5%")
 assert not numeric_correct("$5.2 billion", [5.2e6], "$5.2 million") and numeric_correct("$1,318 million", [1318.0], "$1,318.0")
+assert numeric_correct("It rose 1%", [0.9626], "1.0%") and not numeric_correct("about $1 billion", [1.4e9], "$1.4 billion")
 
 CALC_TYPES = ("calculation", "derived_calculation")
 assert REFUSAL_RE.search("The 2023 annual report does not contain information about it")
@@ -1228,10 +1243,18 @@ print(demo_search.invoke({"query": "total operating expenses 2023 2022"}))
 # - **Guard node.** Before an answer is accepted, it checks two things and may nudge once each:
 #   1. *Search first.* No answering from memory. Ollama ignores `tool_choice`, so the harness enforces this; the
 #      rule comes from the lab.
-#   2. *Calculator check.* If the draft answer contains a number that appears in no retrieved passage and
-#      `run_python` was never called, the model is asked to compute it with the tool. The Module 4 lab recorded
-#      the agent skipping the calculator. This check uses only information available at answer time, never the
-#      gold answer.
+#   2. *Calculator check.* The draft answer contains a number and `run_python` was never called. The model is
+#      asked to compute the figure with the tool if
+#      - the number appears in no retrieved passage (so it was computed in the model's head), or
+#      - the question asks for a change, total, ratio or percentage (a keyword rule on the question). This catches
+#        answers that copy a figure the passage states but that answers a different question, for example a
+#        percentage of sales when the question asks for a percentage of cost. It also catches answers that list
+#        the two figures without combining them.
+#
+#      Each nudge fires at most once. On dev, the model often answered the second nudge with mental arithmetic
+#      instead of a tool call, so the first nudge may follow it when the rewritten answer contains such a number.
+#      The Module 4 lab recorded the agent skipping the calculator. Both checks use only information available at
+#      answer time, never the gold answer.
 #
 # The prompt's worked example uses an invented company, so no test question leaks into it.
 
@@ -1284,6 +1307,12 @@ Source: [<passage id>]
 NUDGE_SEARCH = "You must call search_filings before answering. Do not answer from memory."
 NUDGE_CALC = ("Your answer contains a number that is not written in the retrieved passages. Compute it with "
               "run_python using the numbers from the passages, then give the final answer in the required format.")
+NUDGE_CALC_Q = ("This question asks for a calculated figure (a change, total, ratio or percentage). Call run_python now "
+                "with the numbers from the passages, for example run_python(code=\"answer = (a - b) / b * 100\") with "
+                "a and b replaced by the figures. Give the final answer in the required format only after it returns.")
+CALC_INTENT_RE = re.compile(
+    r"\b(?:combined|total|sum|difference|chang(?:e|ed)|increas(?:e|ed)|decreas(?:e|ed)|grow|grew|growth|"
+    r"declin(?:e|ed)|ratio|percent(?:age)?|share|proportion|by how much|how much (?:more|less|higher|lower))\b", re.I)
 FINALIZE = ("Step limit reached. Do not call any tools. Give your best final answer now from the passages above, "
             "in the required two-line format.")
 
@@ -1328,10 +1357,15 @@ def build_agent(ticker=None, calculator=True, use_filter=True, guard=True, tempe
         used_calc = any(m.name == "run_python" for m in msgs if isinstance(m, ToolMessage))
         if guard and not passages and nudges.count("search") < 2:
             return Command(goto="agent", update={"messages": [HumanMessage(NUDGE_SEARCH)], "nudges": nudges + ["search"]})
-        draft = msgs[-1].content
-        if (guard and calculator and not used_calc and "calc" not in nudges and passages
-                and answer_numbers_unsupported(draft.split("Source:")[0], passages)):
-            return Command(goto="agent", update={"messages": [HumanMessage(NUDGE_CALC)], "nudges": nudges + ["calc"]})
+        draft = msgs[-1].content.split("Source:")[0]
+        # Each calculator nudge fires at most once. "calc" may follow "calc_question": the model often answers that
+        # nudge with mental arithmetic, which then shows up as an unsupported number.
+        if guard and calculator and not used_calc and passages and extract_numbers(draft):
+            if "calc" not in nudges and answer_numbers_unsupported(draft, passages):
+                return Command(goto="agent", update={"messages": [HumanMessage(NUDGE_CALC)], "nudges": nudges + ["calc"]})
+            if not {"calc", "calc_question"} & set(nudges) and CALC_INTENT_RE.search(msgs[0].content.split("Question:")[-1]):
+                return Command(goto="agent", update={"messages": [HumanMessage(NUDGE_CALC_Q)],
+                                                     "nudges": nudges + ["calc_question"]})
         return Command(goto=END)
 
     g = StateGraph(AgentState)
@@ -1537,8 +1571,9 @@ plt.show()
 
 # %%
 val_pool = pd.concat([scored[c].assign(condition=c) for c in ("B1_plain_rag", "B2_rag_cot", "S_agent")])
+val_pool["answer_key"] = ["h" + hashlib.sha1(a.encode()).hexdigest()[:12] for a in val_pool.answer]   # Excel-safe id
 val_sample = pd.concat([g.sample(min(20, len(g)), random_state=SEED) for _, g in val_pool.groupby("condition")])
-export_once(val_sample[["condition", "qid", "question", "gold_answer", "answer"]].assign(human_correct=""),
+export_once(val_sample[["condition", "qid", "answer_key", "question", "gold_answer", "answer"]].assign(human_correct=""),
             "judge_validation_to_label.csv")
 val_path = LABELS / "judge_validation_labels.csv"
 if val_path.exists():
@@ -1546,7 +1581,12 @@ if val_path.exists():
     hv = pd.read_csv(val_path)
     hv = hv[hv.human_correct.astype(str).str.strip().str.lower().isin(["yes", "no"])]
     hv["human"] = hv.human_correct.str.strip().str.lower() == "yes"
-    hv = hv.merge(val_pool[["condition", "qid", "judge_ok", "llm_judge_ok"]], on=["condition", "qid"])
+    n_labelled = len(hv)
+    hv = hv.drop(columns="answer").merge(val_pool[["condition", "qid", "answer_key", "judge_ok", "llm_judge_ok"]],
+                                         on=["condition", "qid", "answer_key"])
+    if len(hv) != n_labelled:
+        raise RuntimeError(f"{n_labelled - len(hv)} human labels in {val_path} are for answers that the current "
+                           "predictions no longer contain (the system changed after labelling): re-label them")
     for col in ("judge_ok", "llm_judge_ok"):
         ok = hv[col].notna()
         print(f"{col:13s} vs human on {int(ok.sum())} answers: agreement {np.mean(hv.human[ok] == hv[col][ok].astype(bool)):.1%}, "
@@ -1602,7 +1642,8 @@ display(sc_table.set_index("condition").round(3))
 #   error.
 #
 # Teammate C checks every case, corrects the category where needed, and notes what we would change
-# (`failures_to_categorize.csv` → `failures_categorized.csv`).
+# (`failures_to_categorize__test.csv` → `failures_categorized__test.csv`; `__quick` files hold the quick subset's
+# failures).
 
 # %%
 def auto_category(r):
@@ -1624,15 +1665,21 @@ def auto_category(r):
 s_res = scored["S_agent"]
 failures = s_res[s_res.judge_ok.map(lambda v: v is False)].copy()   # None = no verdict, not a failure
 failures["auto_category"] = [auto_category(r) for r in failures.itertuples()]
+failures["answer_key"] = ["h" + hashlib.sha1(a.encode()).hexdigest()[:12] for a in failures.answer]
 print(f"S failures: {len(failures)} of {len(s_res)}")
 display(failures.auto_category.value_counts().rename("failures").to_frame())
 pd.set_option("display.max_colwidth", 160)
 display(failures[["qid", "qtype", "question", "gold_answer", "answer", "auto_category"]].head(25))
-export_once(failures[["qid", "qtype", "question", "gold_answer", "answer", "auto_category"]]
-            .assign(human_category="", what_to_change=""), "failures_to_categorize.csv")
-cat_path = LABELS / "failures_categorized.csv"
+eval_tag = "quick" if QUICK_RUN else "test"       # the full test run has far more failures than the quick subset
+export_once(failures[["qid", "answer_key", "qtype", "question", "gold_answer", "answer", "auto_category"]]
+            .assign(human_category="", what_to_change=""), f"failures_to_categorize__{eval_tag}.csv")
+cat_path = LABELS / f"failures_categorized__{eval_tag}.csv"
 if cat_path.exists():
     fc = pd.read_csv(cat_path)
+    stale = set(zip(fc.qid, fc.answer_key)) - set(zip(failures.qid, failures.answer_key))
+    if stale:
+        raise RuntimeError(f"{len(stale)} rows of {cat_path} describe answers the current predictions no longer "
+                           "contain (the system changed after categorising): re-categorise them")
     display(fc.human_category.value_counts().rename("failures (human categories)").to_frame())
 else:
     print(f"PENDING: {cat_path} not provided yet")
@@ -1642,6 +1689,18 @@ else:
 #
 # `ask(question, ticker)` runs the full system on one question and prints how it got there: every tool call, what
 # came back, the final answer and the cited passage.
+#
+# Both examples are **dev** questions, chosen before any test result was looked at. They behaved the same way in
+# every dev run, but a live run can still differ (section 9, run-to-run variation).
+#
+# 1. **Success.** Hasbro's goodwill impairment plus loss on disposal (gold: **$1,499.0 million**). The model adds
+#    $960.0M + $539.0M in its head and writes "$1,500.0 million". The calculator check sees a number that no passage
+#    states, `run_python` returns 1,499, and the answer is corrected.
+# 2. **Honest failure.** How much did NVIDIA's Compute & Networking gross margin decrease? The filing gives only
+#    the reason, not a figure (gold: *it decreased, primarily because of inventory provisions*). The agent finds that
+#    passage, but answers "decreased by 36%", a number taken from the segment revenue table: 36% is the revenue
+#    *growth*. Even the calculator nudge does not change it. A small model under a "how much" question prefers a
+#    wrong number to no number, and the citation is the only thing that lets a reader catch it.
 
 # %%
 def ask(question: str, ticker: str = None):
@@ -1653,7 +1712,12 @@ def ask(question: str, ticker: str = None):
     return rec
 
 
-_ = ask("By how much did total operating expenses increase from 2022 to 2023, in percent?", ticker="DAL")
+demo_success = ask("What were the non-cash goodwill impairment charge and the loss on disposal of business combined?",
+                   ticker="HAS")
+
+# %%
+demo_failure = ask("How much did the Compute & Networking segment's gross margin decrease in fiscal year 2023?",
+                   ticker="NVDA")
 
 # %% [markdown]
 # ## 9. Limitations & Ethics
@@ -1680,6 +1744,11 @@ _ = ask("By how much did total operating expenses increase from 2022 to 2023, in
 # - **Evaluation limits.** The judge is a small LLM, checked against human labels (6.1). Numeric matching uses a
 #   1% tolerance, ignores the sign, and cannot check the scale when the gold answer has none (a gold "$1.60" is
 #   matched by "$1.60 billion"). Full-test-set numbers come from cached runs (4.1).
+# - **Run-to-run variation.** Ollama at temperature 0 with a fixed seed is not fully deterministic across runs or
+#   GPUs. The dev question on Coca-Cola's interest paid in 2022 and 2023 was answered correctly in some runs and
+#   wrongly in others, sometimes within the same notebook run (the model mixed in *interest expense* from the
+#   neighbouring passage). A fresh live run can differ by a few questions, so the reported numbers are the saved
+#   predictions.
 
 # %% [markdown]
 # ## 10. References

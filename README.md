@@ -105,4 +105,8 @@ The notebook exports the files below to `artifacts/labels/`. Fill one in and sav
 | `real_calc_to_verify.csv` | `verified` (yes/no), `note` | `real_calc_verified.csv` |
 | `derived_calc_to_verify.csv` | `verified` (yes/no), `note` | `derived_calc_verified.csv` |
 | `judge_validation_to_label.csv` | `human_correct` (yes/no) | `judge_validation_labels.csv` |
-| `failures_to_categorize.csv` | `human_category`, `what_to_change` | `failures_categorized.csv` |
+| `failures_to_categorize__test.csv` | `human_category`, `what_to_change` | `failures_categorized__test.csv` |
+
+The failure list depends on the evaluation set: `__quick` files come from a `QUICK_RUN` (only a handful of failures), `__test` files from the full test run. Categorise the `__test` file for the report.
+
+Two exports carry an `answer_key` column. If the system changes after you label them, the notebook stops with an error instead of comparing your labels with answers you never saw.
