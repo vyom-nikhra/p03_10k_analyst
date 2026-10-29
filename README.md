@@ -14,6 +14,13 @@ The graded deliverable is the notebook `P03_Financial_10K_Analyst.ipynb`.
 
 ## Setup (any laptop)
 
+**Get the code** (public repo; `artifacts/` with the derived set, label files and saved predictions comes with it):
+```
+git clone https://github.com/vyom-nikhra/p03_10k_analyst.git
+cd p03_10k_analyst
+```
+Without internet access, use the bundle file instead: `git clone p03_10k_analyst.bundle p03_10k_analyst`. To connect that copy to GitHub afterwards, run `git remote set-url origin https://github.com/vyom-nikhra/p03_10k_analyst.git`.
+
 **Requirements**
 - Python 3.10–3.12 (developed on 3.11)
 - [Ollama](https://ollama.com) (a recent version)
@@ -71,7 +78,12 @@ Every line should show `[ OK ]`. The first run downloads the dataset and two sma
 - `AGENT_MODEL` / `JUDGE_MODEL`, to change the models
 
 ## Colab (T4)
-Open the notebook in Colab and run it top to bottom. The setup section detects Colab, installs Ollama with the official script, starts `ollama serve` in the background and pulls both models. Torch is already installed on Colab.
+The notebook reads `artifacts/` from the repo, so clone it in the first Colab cell:
+```
+!git clone https://github.com/vyom-nikhra/p03_10k_analyst.git
+%cd p03_10k_analyst
+```
+Then open `P03_Financial_10K_Analyst.ipynb` from the Colab file browser and run it top to bottom. The setup section detects Colab, installs Ollama with the official script, starts `ollama serve` in the background and pulls both models. Torch is already installed on Colab. This path has not been tested on Colab yet (P8).
 
 ## Running the notebook
 The notebook source is `P03_Financial_10K_Analyst.py`, in jupytext "percent" format. Build the `.ipynb` from it, then execute it:
@@ -92,11 +104,7 @@ Flags are set at the top of the notebook, or with environment variables of the s
 
 Expected time, estimated from quick-run timings: about 9 hours on the 4 GB planning laptop, where the model runs half on the CPU. On the RTX 4070 it should be roughly 3–4 hours.
 
-1. **Copy the repo** to the RTX 4070 laptop, including `artifacts/`; `artifacts/cache/` is rebuilt on first use. There is no git remote yet, so copy the folder, or use a bundle:
-   ```
-   git bundle create p03.bundle --all
-   git clone p03.bundle p03_10k_analyst
-   ```
+1. **Get the repo** on the RTX 4070 laptop with `git clone` or the bundle (see "Get the code" above). `artifacts/cache/` is not in the repo and is rebuilt on first use.
 2. **Set up** with steps 1–4 above. `python check_setup.py` must pass.
 3. **Add the verification files first** (recommended). Put the teammates' `derived_calc_verified.csv` and `real_calc_verified.csv` in `artifacts/labels/`. Rejected items are then dropped before the run, so no time is spent on them. Running without the files also works: predictions for items rejected later are simply ignored.
 4. **Run it with the venv activated.** The `python3` Jupyter kernel starts whatever `python` is first on PATH.
@@ -107,7 +115,7 @@ Expected time, estimated from quick-run timings: about 9 hours on the 4 GB plann
    python -m jupytext --to ipynb P03_Financial_10K_Analyst.py
    python -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 P03_Financial_10K_Analyst.ipynb
    ```
-5. **Commit the results** and bring them back the same way:
+5. **Commit and push the results** (`git push`; a bundle copy needs the `set-url` step above first):
    - `artifacts/preds/`
    - `artifacts/judge/`
    - `artifacts/labels/failures_to_categorize__test.csv`
