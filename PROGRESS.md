@@ -46,6 +46,7 @@ Every change to the project gets a timestamped line in `logbook.md` as soon as i
   - Python: the project venv `.venv` uses Python 3.11.9; the system default is 3.13.5.
   - Ollama: updated to 0.40.11.
   - torch 2.14.1+cu126; pinned packages in `requirements.txt`.
+- RTX 4070 laptop (Kumarran): RTX 4070 Laptop 8GB, 32GB RAM. Set up on 2026-10-29: Ollama 0.40.13, both models pulled, `.venv` (Python 3.11.9, torch 2.14.1+cu126), `check_setup.py` passes. qwen3:4b-instruct at `num_ctx=8192` runs 100% on the GPU, with phi4-mini loaded alongside.
 - Model storage (tool defaults): Ollama models in `C:\Users\LENOVO\.ollama\models`; Hugging Face cache in `C:\Users\LENOVO\.cache\huggingface`.
 - Notebook workflow: edit `P03_Financial_10K_Analyst.py` (jupytext percent), then build and execute:
   `jupytext --to ipynb P03_Financial_10K_Analyst.py` and `jupyter nbconvert --to notebook --execute --inplace P03_Financial_10K_Analyst.ipynb`.
