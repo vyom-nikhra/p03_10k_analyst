@@ -18,9 +18,9 @@
 # | Member | Contribution (sections, code, experiments) |
 # |---|---|
 # | Vyom Nikhra | System design and all code: retrieval (5a), tools and sandbox (5b), agent graph (5b), evaluation harness (6), demo (8) |
-# | <member A> | Hand-verified the derived calculation set and hand-labelled 100 question-type tags (3); data and design slides |
-# | <member B> | Hand-labelled answers for judge validation (6); results and ablation slides |
-# | <member C> | Categorised the failure cases (7); wrote limitations and ethics (9); error-analysis slides |
+# | <member A> | Derived calculation set and question-type labels (3); data and design slides |
+# | <member B> | Judge validation (6); results and ablation slides |
+# | <member C> | Failure analysis (7); wrote limitations and ethics (9); error-analysis slides |
 
 # %% [markdown]
 # ## 1. Problem Statement
@@ -346,7 +346,7 @@ print("number parser tests passed")
 # | `unexplained` | a new number that no single operation reproduces; usually a gold answer with facts not in the passage. Excluded from the test sets. |
 #
 # Requiring the arithmetic to reproduce the gold number also checks the gold answer. Coincidental matches are
-# possible, so a teammate verifies every real `calculation` item, and blind-labels a stratified sample of 100
+# possible, so a reviewer verifies every real `calculation` item, and blind-labels a stratified sample of 100
 # rows to measure agreement (3.5).
 
 # %%
@@ -382,10 +382,15 @@ for kind in ("calculation", "unexplained"):
         print(f"Q: {r.question}\nA: {r.answer}\nC: {r.context[:240]}\n")
 
 # %% [markdown]
-# ### 3.5 Human checks of the labels
+# ### 3.5 Reviewer checks of the labels
 #
-# The notebook exports three files to `artifacts/labels/`. A teammate fills them in and saves each one under the
+# The notebook exports three files to `artifacts/labels/`. A reviewer fills them in and saves each one under the
 # "completed" name shown below. Exports are written only once, so a re-run never overwrites labelling work.
+#
+# **Who reviewed.** All label files in this submission (3.5, 3.6, 6.1, 7) were filled in with model assistance under
+# a team member's supervision, not labelled independently by hand. They are a careful second check, but they are not
+# an independent human judgment; the agreement figures below should be read that way. Each file keeps the column
+# name the notebook reads (`human_label`, `verified`, `human_correct`, `human_category`).
 #
 # | Export | Task | Completed file |
 # |---|---|---|
@@ -430,15 +435,15 @@ if human_path.exists():
     from sklearn.metrics import cohen_kappa_score
     h = pd.read_csv(human_path).merge(df[["qid", "qtype"]], on="qid")
     h = h[h.human_label.notna() & (h.human_label.astype(str).str.strip() != "")]
-    print(f"rule vs human on {len(h)} rows: agreement {np.mean(h.human_label == h.qtype):.1%}, "
+    print(f"rule vs reviewer on {len(h)} rows: agreement {np.mean(h.human_label == h.qtype):.1%}, "
           f"Cohen's kappa {cohen_kappa_score(h.human_label, h.qtype):.2f}")
-    display(pd.crosstab(h.human_label, h.qtype, rownames=["human"], colnames=["rule"]))
+    display(pd.crosstab(h.human_label, h.qtype, rownames=["reviewer"], colnames=["rule"]))
 else:
-    print(f"PENDING: {human_path} not provided yet, so rule-vs-human agreement is not computed")
+    print(f"PENDING: {human_path} not provided yet, so rule-vs-reviewer agreement is not computed")
 
 real_calc_ok = read_verified("real_calc_verified.csv", "qid")
 print("real calculation items:", int((df.qtype == "calculation").sum()),
-      "| human-verified:" , "pending" if real_calc_ok is None else len(real_calc_ok))
+      "| reviewer-verified:", "pending" if real_calc_ok is None else len(real_calc_ok))
 
 # %% [markdown]
 # ### 3.6 Derived calculation questions
@@ -595,7 +600,7 @@ display(derived.operation.value_counts().rename("derived questions").to_frame())
 export_once(derived[["qid", "ticker", "question", "operation", "operand_a", "operand_b", "gold_answer", "context"]]
             .assign(verified="", note=""), "derived_calc_to_verify.csv")
 derived_ok = read_verified("derived_calc_verified.csv", "qid")    # applied in 3.7, after the split assignment
-print(f"derived calculation questions passing the automatic checks: {len(derived)}; human-verified: "
+print(f"derived calculation questions passing the automatic checks: {len(derived)}; reviewer-verified: "
       f"{'pending' if derived_ok is None else len(derived_ok & set(derived.qid))}")
 display(derived[["question", "operation", "operand_a", "operand_b", "gold_answer"]].head(5))
 
@@ -610,7 +615,7 @@ display(derived[["question", "operation", "operand_a", "operand_b", "gold_answer
 # | dev | 15 `text_lookup` + 15 `numeric_lookup` + 20 derived questions. No real calculation question is used for dev, so all of them stay in test. |
 # | quick | 10 test questions per type. Used live when `QUICK_RUN = True`. |
 #
-# Calculation items that a teammate marks as wrong (3.5, 3.6) are removed **after** this assignment. A rejected
+# Calculation items that the reviewer marks as wrong (3.5, 3.6) are removed **after** this assignment. A rejected
 # item therefore never pulls another question from dev into test; the type just has fewer questions.
 
 # %%
@@ -649,13 +654,13 @@ for kind, g in questions[questions.split == "test"].groupby("qtype"):
     quick_ids |= set(g.sample(min(CONFIG["n_quick_per_type"], len(g)), random_state=SEED).qid)
 questions["quick"] = questions.qid.isin(quick_ids)
 
-# Items a teammate rejected are dropped only now, after dev/test/quick were assigned, so verification never moves a
+# Items the reviewer rejected are dropped only now, after dev/test/quick were assigned, so verification never moves a
 # question between dev and test.
 keep = pd.Series(True, index=questions.index)
 for kind, ok in (("calculation", real_calc_ok), ("derived_calculation", derived_ok)):
     if ok is not None:
         keep &= (questions.qtype != kind) | questions.qid.isin(ok)
-print(f"dropped {int((~keep).sum())} items that failed human verification")
+print(f"dropped {int((~keep).sum())} items that failed reviewer verification")
 questions = questions[keep].reset_index(drop=True)
 
 (ART / "splits.json").write_text(json.dumps({s: sorted(g.qid) for s, g in questions.groupby("split")}, indent=1))
@@ -689,7 +694,7 @@ print(f"quick subset: {int(questions.quick.sum())} questions")
 #
 #   On real answers the LLM judge alone said YES to refusals and to wrong figures, such as "$138.0M" against a gold
 #   "$132.4M" (dev check, logbook 2026-10-28). That is why the rule checks run first. Section 6 validates the
-#   combined verdict against human labels.
+#   combined verdict against reviewer labels.
 # - **Numeric accuracy** (calculation questions): every gold number must appear in the answer within 1%, either at
 #   its exact value or as rounded in the gold answer text (exact 0.963%, gold "1.0%", answer "1%"). Answers
 #   written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`. The scale (thousand / million / billion)
@@ -1639,8 +1644,11 @@ display(targets.round(3))
 # %% [markdown]
 # ### 6.1 Is the judge trustworthy?
 #
-# Teammate B labels a stratified sample of answers from B1, B2 and S **blind** (without seeing the judge's
+# A reviewer labels a stratified sample of answers from B1, B2 and S **blind** (without seeing the judge's
 # verdict). We then report agreement and Cohen's κ against the combined verdict and against the LLM judge alone.
+# Answers to calculation items rejected in 3.5/3.6 are left unlabelled, since those questions are no longer scored.
+# The labels are model-assisted (3.5), so this measures agreement with a careful second reader, not with
+# independent human judgment.
 
 # %%
 val_pool = pd.concat([scored[c].assign(condition=c) for c in ("B1_plain_rag", "B2_rag_cot", "S_agent")])
@@ -1658,14 +1666,14 @@ if val_path.exists():
     hv = hv.drop(columns="answer").merge(val_pool[["condition", "qid", "answer_key", "judge_ok", "llm_judge_ok"]],
                                          on=["condition", "qid", "answer_key"])
     if len(hv) != n_labelled:
-        raise RuntimeError(f"{n_labelled - len(hv)} human labels in {val_path} are for answers that the current "
+        raise RuntimeError(f"{n_labelled - len(hv)} labels in {val_path} are for answers that the current "
                            "predictions no longer contain (the system changed after labelling): re-label them")
     for col in ("judge_ok", "llm_judge_ok"):
         ok = hv[col].notna()
-        print(f"{col:13s} vs human on {int(ok.sum())} answers: agreement {np.mean(hv.human[ok] == hv[col][ok].astype(bool)):.1%}, "
+        print(f"{col:13s} vs reviewer on {int(ok.sum())} answers: agreement {np.mean(hv.human[ok] == hv[col][ok].astype(bool)):.1%}, "
               f"kappa {cohen_kappa_score(hv.human[ok], hv[col][ok].astype(bool)):.2f}")
 else:
-    print(f"PENDING: {val_path} not provided yet, so judge agreement with humans is not computed")
+    print(f"PENDING: {val_path} not provided yet, so judge agreement with the reviewer is not computed")
 
 # %% [markdown]
 # ### 6.2 Stretch goal: self-consistency on calculation questions
@@ -1704,28 +1712,30 @@ display(sc_table.set_index("condition").round(3))
 # %% [markdown]
 # ### 6.3 What the results say
 #
-# Full test set, n = 397 (200 lookups, 197 calculations). These numbers are from before the teammates' check of
-# the calculation questions, so they change once rejected items are dropped (3.7). The p-values are not corrected
-# for the 16 comparisons; read p ≈ 0.02–0.05 as a signal, not proof.
+# Test set after verification, n = 318 (200 lookups, 118 calculations: 42 real, 76 derived). The p-values are not
+# corrected for the 16 comparisons; read p ≈ 0.02–0.05 as a signal, not proof.
 #
-# - **Research question: partly no.** Overall, S is no better than RAG + CoT (0.748 vs 0.758, paired difference
-#   −0.010, 95% CI [−0.050, 0.030]). It beats plain RAG overall (+0.050, p = 0.03).
-# - **Lookups: better than both baselines.** S 0.890 vs B1 0.825 and B2 0.835. The lookup target (within 3 points of
-#   B1) is met with room to spare.
-# - **Calculations: worse than RAG + CoT.** S 0.645 numeric accuracy vs B2 0.721 (−0.076, p = 0.02). The target of
-#   +15 points over B2 is clearly missed. Writing the arithmetic out step by step in text did better than our agent
-#   on these questions.
-# - **The calculator helps when it is used, but it is used too rarely.** Removing it (A2) costs 5.6 points of
-#   numeric accuracy on calculations (p = 0.03), but S calls it on only 58% of calculation questions (target 90%).
-#   "Calculator not called" is the largest failure group in section 7. Making the tool call reliable, rather than
-#   adding more tools, is the clearest next step.
-# - **The ticker filter is the biggest single component.** Without it (A1), accuracy falls 18 points
-#   (0.748 → 0.569, p < 0.001): the agent answers from the wrong company's filing. (A1's latency in the table is
+# - **Research question: no.** Overall, S is level with RAG + CoT (0.852 vs 0.849, paired difference +0.003,
+#   95% CI [−0.041, 0.047]) and with the agent without a calculator (A2, 0.855). It is ahead of plain RAG (+0.041),
+#   but that gap is not significant (p = 0.12).
+# - **Lookups: better than both baselines.** S 0.890 vs B1 0.825 (p = 0.05) and B2 0.835 (p = 0.05). The lookup
+#   target (within 3 points of B1) is met.
+# - **Calculations: worse than RAG + CoT.** Numeric accuracy S 0.805 vs B2 0.898 (−0.093, 95% CI [−0.169, −0.017],
+#   p = 0.03). The target of +15 points over B2 is clearly missed: writing the arithmetic out step by step in text
+#   did better than our agent on these questions.
+# - **The calculator is used too rarely to matter.** S calls it on 66% of calculation questions (target 90%), and
+#   removing it (A2) costs 4.2 points of numeric accuracy, which is within noise (p = 0.30). Section 7 shows why:
+#   the agent copies a rounded percentage the passage already states, adds in its head, or misreports the tool's
+#   result.
+# - **The ticker filter is the biggest single component.** Without it (A1), accuracy falls 20 points
+#   (0.852 → 0.654, p < 0.001): the agent answers from the wrong company's filing. (A1's latency in the table is
 #   inflated by a GPU-memory slowdown during that run, not by the condition.)
-# - **Self-consistency is not worth it here.** Three votes per calculation question raise numeric accuracy from
-#   0.645 to 0.660 at 2.9× the LLM calls and tokens.
-# - **Cost.** S makes about 3 LLM calls and uses about 3,400 tokens per question, against 1 call and 650 tokens for
+# - **Self-consistency helps a little.** Three votes per calculation question raise numeric accuracy from 0.805 to
+#   0.839 at 2.9× the LLM calls and tokens.
+# - **Cost.** S makes about 3 LLM calls and uses about 3,100 tokens per question, against 1 call and 640 tokens for
 #   B2: roughly 5× the tokens for no overall gain.
+# - **The judge holds up.** Against the reviewer's labels (6.1) the combined verdict agrees on 93% of answers
+#   (κ = 0.73); the LLM judge alone on 89% (κ = 0.50), which is why the rule checks run first.
 
 # %% [markdown]
 # ## 7. Error Analysis
@@ -1740,7 +1750,7 @@ display(sc_table.set_index("condition").round(3))
 # - **judge disagrees (text):** the rules passed but the LLM judge said no. This may be a wrong answer or a judge
 #   error.
 #
-# Teammate C checks every case, corrects the category where needed, and notes what we would change
+# A reviewer checks every case, corrects the category where needed, and notes what we would change
 # (`failures_to_categorize__test.csv` → `failures_categorized__test.csv`; `__quick` files hold the quick subset's
 # failures).
 
@@ -1779,9 +1789,27 @@ if cat_path.exists():
     if stale:
         raise RuntimeError(f"{len(stale)} rows of {cat_path} describe answers the current predictions no longer "
                            "contain (the system changed after categorising): re-categorise them")
-    display(fc.human_category.value_counts().rename("failures (human categories)").to_frame())
+    display(fc.human_category.value_counts().rename("failures (reviewed categories)").to_frame())
 else:
     print(f"PENDING: {cat_path} not provided yet")
+
+# %% [markdown]
+# **What the reviewed failures show** (47 of 318 S answers):
+# - **Not all are system errors.** 8 are ambiguous questions or gold answers (for example, a "percentage decrease"
+#   between two margins, where the gold gives the point change and the agent the relative change), and 6 answers are
+#   correct but marked wrong: a correct difference where the gold lists both values, or a ratio the gold rounds
+#   (1.014 vs 1.01). The true error rate of S is therefore somewhat below 15%.
+# - **The calculator path fails in three ways** (12 cases): it is not called (5; the agent copies a rounded
+#   percentage the passage states, or adds in its head), the wrong operands go in (4), or the tool's result is
+#   misreported (3; once the raw `run_python(...)` text became the final answer).
+# - **Reading errors** (13): the wrong passage or figure (8) and incomplete answers (5). Two of the incomplete
+#   answers come from the calculator nudge pushing a lookup question into arithmetic.
+# - **Search failures** (6): in 4 cases the agent never called `search_filings`, even after two nudges; in 2 the
+#   gold passage was not retrieved. 2 more answers refused although the right passage had been retrieved.
+#
+# **What we would change first:** force a search on the first step, run any arithmetic the final answer contains
+# through `run_python` (and execute tool-call text instead of returning it), and fire the calculator nudge only on
+# questions that ask for a number.
 
 # %% [markdown]
 # ## 8. Demo
@@ -1830,7 +1858,8 @@ demo_failure = ask("How much did the Compute & Networking segment's gross margin
 # - **Data limits.** The Q&A pairs were generated by an LLM from one 2023 10-K per company: 69 mostly large US
 #   companies. About 50 gold answers state facts that are not in their passage (the "unexplained" bucket, 3.4).
 #   The derived calculation questions are synthetic, although every gold value is computed by code and checked by a
-#   teammate. Results may not transfer to full filings, other years, tables, or smaller companies.
+#   reviewer; about half (82 of 169) were rejected as not sensible or wrong. Results may not transfer to full
+#   filings, other years, tables, or smaller companies.
 # - **Who could be harmed.** An analyst or investor who trusts a confidently stated but wrong figure. Every answer
 #   cites its passage so it can be checked. The system is a reading aid, **not financial advice**.
 # - **Security.** The calculator runs model-written code. The allow-list and the separate process stop imports,
@@ -1841,7 +1870,8 @@ demo_failure = ask("How much did the Compute & Networking segment's gross margin
 #   used to produce authoritative-looking but wrong financial summaries at scale, which is another reason the
 #   citation is part of every answer.
 # - **Evaluation limits.** Each condition was run once on 397 questions, so differences of a few points are within
-#   noise (see the intervals in 6). The judge is a small LLM, checked against human labels (6.1). Numeric matching uses a
+#   noise (see the intervals in 6). The judge is a small LLM, checked against model-assisted reviewer labels (6.1),
+#   not independent human labels. Numeric matching uses a
 #   1% tolerance, ignores the sign, and cannot check the scale when the gold answer has none (a gold "$1.60" is
 #   matched by "$1.60 billion"). Full-test-set numbers come from cached runs (4.1).
 # - **Run-to-run variation.** Ollama at temperature 0 with a fixed seed is not fully deterministic across runs or

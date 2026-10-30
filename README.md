@@ -136,4 +136,6 @@ The notebook exports the files below to `artifacts/labels/`. Fill one in and sav
 
 The failure list depends on the evaluation set: `__quick` files come from a `QUICK_RUN` (only a handful of failures), `__test` files from the full test run. Categorise the `__test` file for the report.
 
+The completed files in this repo were filled in with model assistance under a team member's supervision, not labelled independently by hand; notebook §3.5 says so.
+
 Two exports carry an `answer_key` column. If the system changes after you label them, the notebook stops with an error instead of comparing your labels with answers you never saw.
