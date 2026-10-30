@@ -82,7 +82,7 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 
 # Flags (environment variables override the defaults, so a full run can be started without editing the notebook)
-QUICK_RUN = os.environ.get("QUICK_RUN", "1") == "1"                # True: evaluate a small fixed sample live
+QUICK_RUN = os.environ.get("QUICK_RUN", "0") == "1"                # True: evaluate a small fixed sample live
 USE_CACHED_PREDS = os.environ.get("USE_CACHED_PREDS", "1") == "1"  # True: full set from artifacts/preds, no live runs
 GENERATE_DERIVED = os.environ.get("GENERATE_DERIVED", "0") == "1"   # True: let the LLM generate missing derived items
 IN_COLAB = "google.colab" in sys.modules
@@ -1564,6 +1564,79 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
+# **How sure are these numbers?** With a few hundred questions, a gap of a few points can be noise. We give each
+# accuracy a 95% bootstrap interval (10,000 resamples of the questions). Every condition answers the same questions,
+# so we compare S with each other condition **paired**: the interval is for the per-question difference, and the
+# p-value is McNemar's exact test on the questions where exactly one of the two is right. Questions without a
+# verdict are left out of a comparison.
+
+# %%
+from scipy.stats import binomtest
+
+N_BOOT = 10_000
+boot_rng = np.random.default_rng(SEED)
+
+
+def in_group(p, group):
+    """'lookup' = text + numeric lookups; 'calculation' = real + derived calculations."""
+    if group == "all":
+        return p
+    return p[p.qtype.isin(CALC_TYPES)] if group == "calculation" else p[~p.qtype.isin(CALC_TYPES)]
+
+
+def outcome(p, col):
+    """0/1 per qid, verdict-less rows dropped."""
+    s = p.set_index("qid")[col]
+    return s[s.notna()].astype(float)
+
+
+def boot_ci(x):
+    x = np.asarray(x, dtype=float)
+    means = x[boot_rng.integers(0, len(x), size=(N_BOOT, len(x)))].mean(axis=1)
+    return np.percentile(means, [2.5, 97.5])
+
+
+def fmt_ci(x):
+    lo, hi = boot_ci(x)
+    return f"{np.mean(x):.3f} [{lo:.3f}, {hi:.3f}]"
+
+
+METRICS = [("judge, all", "judge_ok", "all"), ("judge, lookup", "judge_ok", "lookup"),
+           ("judge, calculation", "judge_ok", "calculation"), ("numeric, calculation", "numeric_ok", "calculation")]
+ci_table = pd.DataFrame({name: {m: fmt_ci(outcome(in_group(p, g), col)) for m, col, g in METRICS}
+                         for name, p in scored.items()}).T
+ci_table.index.name = "condition (accuracy [95% CI])"
+display(ci_table)
+
+paired_rows = []
+for other in ("B2_rag_cot", "B1_plain_rag", "A2_agent_no_calculator", "A1_agent_no_ticker_filter"):
+    for m, col, g in METRICS:
+        both = pd.concat([outcome(in_group(scored["S_agent"], g), col).rename("S"),
+                          outcome(in_group(scored[other], g), col).rename("other")], axis=1, join="inner")
+        diff = both.S - both.other
+        lo, hi = boot_ci(diff)
+        s_only, other_only = int((diff > 0).sum()), int((diff < 0).sum())
+        p = binomtest(s_only, s_only + other_only, 0.5).pvalue if s_only + other_only else 1.0
+        paired_rows.append({"S vs": other, "metric": m, "n": len(both), "S − other": round(diff.mean(), 3),
+                            "95% CI": f"[{lo:.3f}, {hi:.3f}]", "only S right": s_only,
+                            "only other right": other_only, "McNemar p": round(p, 4)})
+paired = pd.DataFrame(paired_rows).set_index(["S vs", "metric"])
+display(paired)
+
+# The success targets of section 1, fixed before any test result
+r5 = retrieval_table.set_index(["retriever", "ticker filter"]).loc[("hybrid RRF + rerank", "on"), "R@5"]
+num_gap = paired.loc[("B2_rag_cot", "numeric, calculation"), "S − other"]
+look_gap = paired.loc[("B1_plain_rag", "judge, lookup"), "S − other"]
+calc_use = results.loc["S_agent", "calculator used (calc)"]
+targets = pd.DataFrame([
+    ("retrieval Recall@5 (hybrid + rerank, filter on)", "≥ 0.90", r5, r5 >= 0.90),
+    ("numeric acc on calculation, S − B2", "≥ +0.15", num_gap, num_gap >= 0.15),
+    ("judge acc on lookup, S − B1", "≥ −0.03", look_gap, look_gap >= -0.03),
+    ("calculator used on calculation questions (S)", "≥ 0.90", calc_use, calc_use >= 0.90),
+], columns=["target", "goal", "result", "met"]).set_index("target")
+display(targets.round(3))
+
+# %% [markdown]
 # ### 6.1 Is the judge trustworthy?
 #
 # Teammate B labels a stratified sample of answers from B1, B2 and S **blind** (without seeing the judge's
@@ -1627,6 +1700,32 @@ sc_table = pd.DataFrame([{"condition": n, "judge acc": p.judge_ok.astype(float).
                           "LLM calls / q": p.llm_calls.mean(), "tokens / q": (p.input_tokens + p.output_tokens).mean()}
                          for n, p in (("S_agent (greedy, 1 run)", s_calc), ("SC3_agent (3 runs, vote)", scored["SC3_agent"]))])
 display(sc_table.set_index("condition").round(3))
+
+# %% [markdown]
+# ### 6.3 What the results say
+#
+# Full test set, n = 397 (200 lookups, 197 calculations). These numbers are from before the teammates' check of
+# the calculation questions, so they change once rejected items are dropped (3.7). The p-values are not corrected
+# for the 16 comparisons; read p ≈ 0.02–0.05 as a signal, not proof.
+#
+# - **Research question: partly no.** Overall, S is no better than RAG + CoT (0.748 vs 0.758, paired difference
+#   −0.010, 95% CI [−0.050, 0.030]). It beats plain RAG overall (+0.050, p = 0.03).
+# - **Lookups: better than both baselines.** S 0.890 vs B1 0.825 and B2 0.835. The lookup target (within 3 points of
+#   B1) is met with room to spare.
+# - **Calculations: worse than RAG + CoT.** S 0.645 numeric accuracy vs B2 0.721 (−0.076, p = 0.02). The target of
+#   +15 points over B2 is clearly missed. Writing the arithmetic out step by step in text did better than our agent
+#   on these questions.
+# - **The calculator helps when it is used, but it is used too rarely.** Removing it (A2) costs 5.6 points of
+#   numeric accuracy on calculations (p = 0.03), but S calls it on only 58% of calculation questions (target 90%).
+#   "Calculator not called" is the largest failure group in section 7. Making the tool call reliable, rather than
+#   adding more tools, is the clearest next step.
+# - **The ticker filter is the biggest single component.** Without it (A1), accuracy falls 18 points
+#   (0.748 → 0.569, p < 0.001): the agent answers from the wrong company's filing. (A1's latency in the table is
+#   inflated by a GPU-memory slowdown during that run, not by the condition.)
+# - **Self-consistency is not worth it here.** Three votes per calculation question raise numeric accuracy from
+#   0.645 to 0.660 at 2.9× the LLM calls and tokens.
+# - **Cost.** S makes about 3 LLM calls and uses about 3,400 tokens per question, against 1 call and 650 tokens for
+#   B2: roughly 5× the tokens for no overall gain.
 
 # %% [markdown]
 # ## 7. Error Analysis
@@ -1741,7 +1840,8 @@ demo_failure = ask("How much did the Compute & Networking segment's gross margin
 # - **Privacy and misuse.** 10-K filings are public, and no personal data is processed. The same pipeline could be
 #   used to produce authoritative-looking but wrong financial summaries at scale, which is another reason the
 #   citation is part of every answer.
-# - **Evaluation limits.** The judge is a small LLM, checked against human labels (6.1). Numeric matching uses a
+# - **Evaluation limits.** Each condition was run once on 397 questions, so differences of a few points are within
+#   noise (see the intervals in 6). The judge is a small LLM, checked against human labels (6.1). Numeric matching uses a
 #   1% tolerance, ignores the sign, and cannot check the scale when the gold answer has none (a gold "$1.60" is
 #   matched by "$1.60 billion"). Full-test-set numbers come from cached runs (4.1).
 # - **Run-to-run variation.** Ollama at temperature 0 with a fixed seed is not fully deterministic across runs or

@@ -96,7 +96,7 @@ Flags are set at the top of the notebook, or with environment variables of the s
 
 | Flag | Default | Effect |
 |---|---|---|
-| `QUICK_RUN` | `1` | Evaluates the 40-question quick subset live. |
+| `QUICK_RUN` | `0` | `1` evaluates the 40-question quick subset live. |
 | `USE_CACHED_PREDS` | `1` | With `QUICK_RUN=0`, scores the full test set from saved predictions in `artifacts/preds/`, with no live LLM runs. |
 | `GENERATE_DERIVED` | `0` | Lets the LLM generate missing derived calculation questions. |
 
