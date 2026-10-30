@@ -96,7 +96,7 @@ Flags are set at the top of the notebook, or with environment variables of the s
 
 | Flag | Default | Effect |
 |---|---|---|
-| `QUICK_RUN` | `1` | Evaluates the 40-question quick subset live. |
+| `QUICK_RUN` | `0` | `1` evaluates the 40-question quick subset live. |
 | `USE_CACHED_PREDS` | `1` | With `QUICK_RUN=0`, scores the full test set from saved predictions in `artifacts/preds/`, with no live LLM runs. |
 | `GENERATE_DERIVED` | `0` | Lets the LLM generate missing derived calculation questions. |
 
@@ -136,6 +136,6 @@ The notebook exports the files below to `artifacts/labels/`. Fill one in and sav
 
 The failure list depends on the evaluation set: `__quick` files come from a `QUICK_RUN` (only a handful of failures), `__test` files from the full test run. Categorise the `__test` file for the report.
 
-**Claude drafts.** Each export except the failure list has a `__claude_draft.csv` copy. Its `claude_suggestion` and `claude_reason` columns hold Claude's first-pass label (yes / no / unsure, or a question type), and the human column is left empty. Review each row, write your own decision in the human column, and save it under the completed name; the extra columns can stay. The notebook reads only the human column, so it reports human checks only when a person has filled it in.
+The completed files in this repo were filled in with model assistance under a team member's supervision, not labelled independently by hand; notebook §3.5 says so.
 
 Two exports carry an `answer_key` column. If the system changes after you label them, the notebook stops with an error instead of comparing your labels with answers you never saw.

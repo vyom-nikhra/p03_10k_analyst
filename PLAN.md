@@ -29,10 +29,10 @@ This is the course group project for UG3/UG4 GenAI, Modules 1–4. The goal is a
 **Penalties:** dataset not loaded from Hugging Face inside the notebook (−10); no outputs saved or notebook fails to run (−5 to −10).
 
 **Working rules (Vyom):**
-- **No deleting without consent.** Never delete a file without Vyom's explicit consent. Editing files, and removing scratch files Claude created itself, are allowed.
+- **No deleting without consent.** Never delete a file without Vyom's explicit consent. Editing files, and removing your own scratch files, are allowed.
 - **Git:**
   - Commit as `Vyom Nikhra`: repo-local `git config user.name "Vyom Nikhra"` and `user.email vyomnikhra@gmail.com`.
-  - **No `Co-Authored-By` or Claude/Anthropic trailers** anywhere: commits, code, notebook, README.
+  - **No `Co-Authored-By` or AI-tool trailers** anywhere: commits, code, notebook, README.
   - Small, focused commits; **ask before any push**.
 - **Code style:** read code before changing it; raise errors explicitly, with no silent recovery or unrequested fallbacks.
   - Applied here: tool errors become agent observations only because the brief requires "tool-error handling", and they are logged and counted.

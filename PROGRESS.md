@@ -10,13 +10,13 @@ Every change to the project gets a timestamped line in `logbook.md` as soon as i
 | Plan | Research, design, plan approved | done (2026-10-28) |
 | P0 | Environment: venv, pinned requirements, Ollama update, model pulls, smoke tests | done (2026-10-28): `python check_setup.py` passes every check on the RTX 3050 laptop |
 | P1 | Notebook §0–3: data, tagging, derived calculation set, splits | done: derived v3 has 169 of 250 items passing the automatic checks; splits dev 50 / test 397 / quick 40 |
-| P1b | Teammates: verify derived calculation items, hand-label 100 type tags | **ready, critical**: exports in `artifacts/labels/` (README table). A spot-check found about 5 of 14 derived items semantically wrong, so derived results mean little until verified |
+| P1b | Verify derived calculation items, label 100 type tags | done (2026-10-31), model-assisted under Kumarran's supervision (notebook §3.5 says so): real calc 42 of 48 kept, derived 87 of 169 kept; rule vs reviewer type tags 90% agreement, κ 0.85 |
 | P2 | §5a retrieval + Recall/MRR grid | done: hybrid+rerank with filter R@1 0.870, R@10 0.988, MRR 0.920 (test, n=423) |
 | P3 | §5b tools + unit tests | done: 14 sandbox asserts pass; search tool checked |
 | P4 | §5b agent graph + guardrails | done: agent **v3** adopted on dev evidence (20 derived dev questions: numerically correct 11 → 13, calculator used 12 → 14, +0.34 LLM calls per question; lookups unchanged). v3 adds a question-keyword calculator nudge and lets the unsupported-number nudge follow it |
-| P5 | Evaluation harness + baselines/ablations → results table | quick run done with agent v3 (n=40): judge acc B0 0.15, B1 0.775, B2 0.75, **S 0.80**, A1 (no filter) 0.55, A2 (no calc) 0.75; calculator used on calc 0.60 (target ≥ 0.9 not met). **Full test run done 2026-10-30 on the RTX 4070 (n=397, before calc verification):** judge acc B0 0.111, B1 0.698, B2 0.758, **S 0.748**, A1 0.569, A2 0.741; S beats B2 on text (0.93 vs 0.87) but loses on derived calc (0.564 vs 0.664); calculator used on calc 0.584. Numbers change once rejected calc items are dropped |
-| P6 | §7–10: error analysis, demo, ethics, references | done for quick mode. Demo: two dev questions (HAS success via the calculator guard; NVDA honest failure, 36% revenue growth read as a margin change). `failures_to_categorize__test.csv` written (100 S failures); needs categorising (and regenerating if verification drops items) |
-| P7 | Stretch: self-consistency, B3, extra ablations | SC3 on the full test calc items (n=197): judge 0.604 → 0.614, numeric 0.645 → 0.660 at 2.9× LLM calls (quick: no gain). B3 and extra ablations not started |
+| P5 | Evaluation harness + baselines/ablations → results table | **done (2026-10-31), verified test set n=318:** judge acc B0 0.126, B1 0.811, B2 0.849, **S 0.852**, A1 0.654, A2 0.855. S = B2 overall (+0.003, CI [−0.041, 0.047]); S better on lookups (0.890 vs 0.835), worse on calculations (numeric 0.805 vs 0.898, p = 0.03); calculator used 66%, A2 gap not significant. 95% CIs and McNemar tests in §6; findings in §6.3 |
+| P6 | §7–10: error analysis, demo, ethics, references | done: 47 S failures categorised (§7 summary: 8 ambiguous question/gold, 6 judge or metric errors, 12 calculator-path, 13 reading, 6 search, 2 refusals); §9 updated. §10 AI-assistance line still a placeholder |
+| P7 | Stretch: self-consistency, B3, extra ablations | SC3 on the verified calc items (n=118): judge 0.788 → 0.822, numeric 0.805 → 0.839 at 2.9× LLM calls. B3 and extra ablations not started |
 | P8 | Freeze: timed Restart & Run All, outputs saved, slides | first executed notebook committed: quick mode 21 min on the RTX 3050 (SC3 live), 5 min with everything cached. Still to do: timed run on the RTX 4070, Colab check, slides |
 
 ## Decisions
@@ -30,11 +30,11 @@ Every change to the project gets a timestamped line in `logbook.md` as soon as i
 - [ ] Timeline: fit the phases to the deadline.
 - [x] Which machine runs P0: the planning laptop (Vyom, 2026-10-28). Large runs go to the RTX 4070 laptop on request.
 - [x] Full test-set run: on the RTX 4070, run by Vyom, preferably after the teammates' derived/real calculation verification (Vyom, 2026-10-28). Step-by-step checklist in the README ("Full evaluation run").
-- [ ] P8: choose the submitted notebook's default flags. Options: `QUICK_RUN=0` + `USE_CACHED_PREDS=1`, which shows full-test results re-scored from the saved predictions; or the current default `QUICK_RUN=1`, which shows the quick subset only.
+- [x] P8: submitted notebook defaults are `QUICK_RUN=0` + `USE_CACHED_PREDS=1` (full test set re-scored from saved predictions).
 - [ ] Instructor: do cached predictions count as "saved artefacts" for the 60-minute rule?
 - [ ] Vyom: wording of the AI-assistance disclosure in §10 (required by the course Integrity rule).
 - [x] Checked in P0: `qwen3:4b-instruct` and `phi4-mini` pull and run on Ollama 0.40.11; `ChatOllama(reasoning=False)` is accepted by qwen3:4b-instruct.
-- [ ] Judge reliability: phi4-mini alone was lenient on real answers (Claude's dev check on B0). Rule gates were added; the combined judge still needs checking against teammate labels (`judge_validation_to_label.csv`, exported by §6.1).
+- [x] Judge reliability: combined verdict vs reviewer labels 93.3% agreement, κ 0.73 (LLM judge alone 88.9%, κ 0.50), 45 answers (§6.1).
 - [ ] Test-set hygiene: the 40 quick-subset outputs (part of test) were read while debugging the harness on 2026-10-28. Agent changes are justified from dev evidence only; the 357 non-quick test questions have never been looked at. Consider reporting them separately as the clean held-out number.
 - [x] Remote: public GitHub repo https://github.com/vyom-nikhra/p03_10k_analyst (`origin`, branch `main`), created at Vyom's request on 2026-10-29. An offline copy is the bundle `D:\genai_project\p03_10k_analyst.bundle`, regenerated from `main` at the time of the push. Teammates need collaborator access to push labels.
 - [ ] Colab: clone the repo in the first cell (README) so the notebook finds `artifacts/`. Not tested on Colab yet.
