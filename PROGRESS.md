@@ -34,7 +34,7 @@ Every change to the project gets a timestamped line in `logbook.md` as soon as i
 - [ ] Instructor: do cached predictions count as "saved artefacts" for the 60-minute rule?
 - [ ] Vyom: wording of the AI-assistance disclosure in §10 (required by the course Integrity rule).
 - [x] Checked in P0: `qwen3:4b-instruct` and `phi4-mini` pull and run on Ollama 0.40.11; `ChatOllama(reasoning=False)` is accepted by qwen3:4b-instruct.
-- [ ] Judge reliability: phi4-mini alone was lenient on real answers (Claude's dev check on B0). Rule gates were added; the combined judge still needs checking against teammate labels (`judge_validation_to_label.csv`, exported by §6.1).
+- [ ] Judge reliability: phi4-mini alone was lenient on real answers (dev check on B0). Rule gates were added; the combined judge still needs checking against teammate labels (`judge_validation_to_label.csv`, exported by §6.1).
 - [ ] Test-set hygiene: the 40 quick-subset outputs (part of test) were read while debugging the harness on 2026-10-28. Agent changes are justified from dev evidence only; the 357 non-quick test questions have never been looked at. Consider reporting them separately as the clean held-out number.
 - [x] Remote: public GitHub repo https://github.com/vyom-nikhra/p03_10k_analyst (`origin`, branch `main`), created at Vyom's request on 2026-10-29. An offline copy is the bundle `D:\genai_project\p03_10k_analyst.bundle`, regenerated from `main` at the time of the push. Teammates need collaborator access to push labels.
 - [ ] Colab: clone the repo in the first cell (README) so the notebook finds `artifacts/`. Not tested on Colab yet.
