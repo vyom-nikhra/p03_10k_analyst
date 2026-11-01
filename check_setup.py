@@ -132,7 +132,7 @@ def agent_tool_call():
 
 
 def agent_reasoning_flag():
-    # Open question from PLAN.md: does ChatOllama(reasoning=False) work for a model with no thinking mode?
+    # Checks that ChatOllama(reasoning=False) works for a model with no thinking mode.
     return _llm(AGENT_MODEL, reasoning=False).invoke("Reply with the single word: ready").content.strip()[:40]
 
 
@@ -162,8 +162,7 @@ def react_graph():
     return f"tools called {called}; final answer contains 19637"
 
 
-# Same rubric as the notebook's judge (section 6). A lenient "numbers may be rounded" wording let
-# gemma3:4b accept a wrong number in the P0 probe; see logbook.md 2026-10-28.
+# Same rubric as the notebook's judge (section 6).
 JUDGE_TEMPLATE = (
     "You grade answers to questions about company annual reports.\n"
     "Question: {q}\nGold answer: {gold}\nCandidate answer: {pred}\n\n"

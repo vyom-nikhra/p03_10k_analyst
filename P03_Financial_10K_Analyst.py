@@ -11,47 +11,37 @@
 # ---
 
 # %% [markdown]
-# # Project P03: Financial 10-K Analyst. Grounded Answers with Exact Calculations
+# # Project P03: Financial 10-K Analyst
 #
-# **Team:** Vyom Nikhra, <member A>, <member B>, <member C>
+# Grounded answers with exact calculations.
 #
-# | Member | Contribution (sections, code, experiments) |
+# | Member | Contribution |
 # |---|---|
-# | Vyom Nikhra | System design and all code: retrieval (5a), tools and sandbox (5b), agent graph (5b), evaluation harness (6), demo (8) |
-# | <member A> | Derived calculation set and question-type labels (3); data and design slides |
-# | <member B> | Judge validation (6); results and ablation slides |
-# | <member C> | Failure analysis (7); wrote limitations and ethics (9); error-analysis slides |
+# | Vyom Nikhra | |
+# | Kumarran Mahesh | |
+# | Kommana Srinivasa Rao | |
+# | Adarsh Reddy | |
+# | Vennela Reddy | |
 
 # %% [markdown]
 # ## 1. Problem Statement
 #
-# - **Problem (our own words):** Analysts ask questions about annual reports (10-K filings) that mix
-#   *lookup* ("what was services revenue?") with *arithmetic* ("what share of revenue came from
-#   services?"). Small language models misread figures from long passages and make token-level
-#   arithmetic slips. We build a single ReAct agent that retrieves the right filing passage, extracts the
-#   numbers, and computes any result with a sandboxed Python tool, so numbers are never guessed.
-# - **Research question:** Does a ≤4B model that delegates retrieval (hybrid RAG with a ticker filter) and
-#   arithmetic (a sandboxed Python tool) through a ReAct loop beat plain RAG and RAG + chain-of-thought on
-#   *calculation* questions without losing accuracy on *lookup* questions, and at what cost?
-# - **What success looks like (targets fixed before any test results):**
-#   - retrieval Recall@5 ≥ 0.90 with the ticker filter;
-#   - on calculation questions, numeric accuracy at least 15 points above RAG + CoT;
-#   - on lookup questions, judge accuracy within 3 points of plain RAG;
-#   - the calculator is called on ≥ 90% of calculation questions.
+# Analysts ask two kinds of questions about 10-K filings: lookups ("what was services revenue?") and arithmetic ("what share of revenue came from services?"). Small models misread figures in long passages and slip on arithmetic. We build one ReAct agent that finds the right passage, pulls out the numbers and computes results in a sandboxed Python tool.
+#
+# **Research question.** Does a 4B model that hands retrieval and arithmetic to tools beat plain RAG and RAG + chain-of-thought on calculation questions, without losing accuracy on lookups? At what cost?
+#
+# **Targets**, fixed before any test result:
+# - retrieval Recall@5 ≥ 0.90 with the ticker filter
+# - numeric accuracy on calculation questions at least 15 points above RAG + CoT
+# - judge accuracy on lookups within 3 points of plain RAG
+# - the calculator called on ≥ 90% of calculation questions
 
 # %% [markdown]
 # ## 2. Setup
 #
-# The notebook runs top to bottom on a laptop with [Ollama](https://ollama.com) or on Colab (T4). On Colab, the
-# cell after the config installs Ollama, starts the server and pulls both models. On a laptop, install Ollama and
-# run `ollama pull qwen3:4b-instruct` and `ollama pull phi4-mini` once (see `README.md`).
+# Runs on a laptop with [Ollama](https://ollama.com) or on Colab (T4). On Colab the cell after the config installs Ollama and pulls both models. On a laptop, run `ollama pull qwen3:4b-instruct` and `ollama pull phi4-mini` once.
 #
-# The following environment variables override the defaults without editing the notebook:
-# - `AGENT_MODEL` and `JUDGE_MODEL`: the models to use.
-# - `OLLAMA_HOST`: the Ollama address.
-#
-# Long LLM jobs write one JSON line per item to `artifacts/`. A crashed run resumes where it stopped, and a
-# re-run reuses earlier results.
+# `AGENT_MODEL`, `JUDGE_MODEL` and `OLLAMA_HOST` override the defaults. Long LLM jobs write one JSON line per item to `artifacts/`, so a stopped run resumes where it left off.
 
 # %%
 # %pip install -q datasets==5.1.0 sentence-transformers==6.2.0 transformers==5.21.0 faiss-cpu==1.15.1 rank-bm25==0.2.2 scikit-learn==1.9.1 langgraph==1.2.18 langchain-core==1.7.0 langchain-ollama==1.1.0 pydantic==2.14.1 pandas==3.1.0 numpy==2.4.6 matplotlib==3.11.2
@@ -182,9 +172,7 @@ class JsonlStore:
 # %% [markdown]
 # ## 3. Data
 #
-# `virattt/financial-qa-10K`: 7,000 question/answer pairs, each with the 10-K passage it was written from
-# (`context`) and the company `ticker`. The knowledge base is the set of **unique passages**. The questions are
-# held out for evaluation and never indexed.
+# `virattt/financial-qa-10K` has 7,000 question/answer pairs. Each comes with the 10-K passage it was written from and the company ticker. The unique passages form the knowledge base. Questions are only used for evaluation and are never indexed.
 
 # %%
 from datasets import load_dataset
@@ -221,13 +209,11 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ### 3.2 Knowledge base: deduplicated passages
+# ### 3.2 Knowledge base
 #
-# Each unique (ticker, normalised passage) is one document, with no further chunking.
-# - **Why no chunking (design choice D1):** passages are already short (median about 27 words), and splitting
-#   them would break the one-to-one link between a question and its gold passage that Recall@k relies on.
-# - **Near-duplicates:** some passages repeat inside others. When one same-ticker passage contains another, both
-#   count as relevant for that question, so retrieving either one is a hit.
+# One document per unique (ticker, passage). We don't chunk: passages are short (median about 27 words), and chunking would break the link between a question and its gold passage that Recall@k depends on.
+#
+# Some passages are contained in others from the same company. Both then count as relevant for that question.
 
 # %%
 from transformers import AutoTokenizer
@@ -263,10 +249,7 @@ print(f"passages longer than the embedder's 512-token window (tail truncated): {
 # %% [markdown]
 # ### 3.3 Number parsing
 #
-# Figures in 10-K text come in many forms: `$1,234.5 million`, `(6)%` for negatives, `-34.7%`, and tables in
-# thousands. The parser below normalises them. It drops dates, bare years, section references like `10(b)` and
-# list markers like `1)`, and it records how many decimals were shown so rounded answers can be matched. The
-# question tagger (3.4) and the numeric-match metric (6) both use it.
+# 10-K figures come as `$1,234.5 million`, `(6)%`, `-34.7%` or table values in thousands. The parser normalises these, skips dates, years, section references like `10(b)` and list markers like `1)`, and records the decimals shown so rounded answers can be matched. The tagger (3.4) and the numeric metric (6) both use it.
 
 # %%
 MONTHS = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
@@ -333,21 +316,18 @@ assert matches_target(extract_numbers("about 31 percent")[0], 4 / 13 * 100)
 print("number parser tests passed")
 
 # %% [markdown]
-# ### 3.4 Question types: lookup or calculation
+# ### 3.4 Question types
 #
-# The brief asks us to tag each question as lookup or calculation. We use **deterministic rules** and check
-# every calculation tag arithmetically:
+# Each question is tagged by rule, and every calculation tag is checked arithmetically:
 #
 # | Type | Rule |
 # |---|---|
-# | `text_lookup` | the gold answer contains no (non-date) number |
-# | `numeric_lookup` | every number in the answer appears in the passage or question (up to scale, sign, rounding) |
-# | `calculation` | each *new* number in the answer is reproduced by **one** operation on two passage numbers: a−b, a+b, a/b, a/b×100, or (a−b)/b×100 |
-# | `unexplained` | a new number that no single operation reproduces; usually a gold answer with facts not in the passage. Excluded from the test sets. |
+# | `text_lookup` | the gold answer has no number other than dates |
+# | `numeric_lookup` | every number in the answer appears in the passage or question (allowing scale, sign, rounding) |
+# | `calculation` | each new number in the answer comes from one operation on two passage numbers: a−b, a+b, a/b, a/b×100 or (a−b)/b×100 |
+# | `unexplained` | a new number no single operation produces, usually a gold answer with facts missing from the passage. Left out of the test set. |
 #
-# Requiring the arithmetic to reproduce the gold number also checks the gold answer. Coincidental matches are
-# possible, so a reviewer verifies every real `calculation` item, and blind-labels a stratified sample of 100
-# rows to measure agreement (3.5).
+# Matches can be coincidental, so every real calculation item is checked and a sample of 100 tags is labelled blind (3.5).
 
 # %%
 def reproducible(target, pool):
@@ -382,23 +362,15 @@ for kind in ("calculation", "unexplained"):
         print(f"Q: {r.question}\nA: {r.answer}\nC: {r.context[:240]}\n")
 
 # %% [markdown]
-# ### 3.5 Reviewer checks of the labels
+# ### 3.5 Label checks
 #
-# The notebook exports three files to `artifacts/labels/`. A reviewer fills them in and saves each one under the
-# "completed" name shown below. Exports are written only once, so a re-run never overwrites labelling work.
-#
-# **Who reviewed.** All label files in this submission (3.5, 3.6, 6.1, 7) were filled in with model assistance under
-# a team member's supervision, not labelled independently by hand. They are a careful second check, but they are not
-# an independent human judgment; the agreement figures below should be read that way. Each file keeps the column
-# name the notebook reads (`human_label`, `verified`, `human_correct`, `human_category`).
+# The notebook exports label files to `artifacts/labels/` once and reads the completed versions on later runs. The completed files were filled in with AI assistance under the team's supervision.
 #
 # | Export | Task | Completed file |
 # |---|---|---|
-# | `qtype_sample_to_label.csv` | 100 rows, stratified, **without the rule's tag** (blind). Fill `human_label` with `text_lookup`, `numeric_lookup`, `calculation` or `unexplained`. | `qtype_human_labels.csv` |
-# | `real_calc_to_verify.csv` | Every real `calculation` row. Set `verified` to `yes` if the gold answer is correct and needs arithmetic on the passage. | `real_calc_verified.csv` |
-# | `derived_calc_to_verify.csv` | Every derived question from 3.6. Set `verified` to `yes` if the question is sensible and the gold answer is right. | `derived_calc_verified.csv` |
-#
-# Until the completed files exist, every item counts as `pending` and the notebook says so.
+# | `qtype_sample_to_label.csv` | 100 stratified rows, rule tag hidden. `human_label` = text_lookup, numeric_lookup, calculation or unexplained. | `qtype_human_labels.csv` |
+# | `real_calc_to_verify.csv` | every real calculation row. `verified` = yes if the gold is right and needs arithmetic. | `real_calc_verified.csv` |
+# | `derived_calc_to_verify.csv` | every derived question (3.6). `verified` = yes if the question makes sense and the gold is right. | `derived_calc_verified.csv` |
 
 # %%
 LABELS = ART / "labels"
@@ -435,33 +407,26 @@ if human_path.exists():
     from sklearn.metrics import cohen_kappa_score
     h = pd.read_csv(human_path).merge(df[["qid", "qtype"]], on="qid")
     h = h[h.human_label.notna() & (h.human_label.astype(str).str.strip() != "")]
-    print(f"rule vs reviewer on {len(h)} rows: agreement {np.mean(h.human_label == h.qtype):.1%}, "
+    print(f"rule vs labels on {len(h)} rows: agreement {np.mean(h.human_label == h.qtype):.1%}, "
           f"Cohen's kappa {cohen_kappa_score(h.human_label, h.qtype):.2f}")
-    display(pd.crosstab(h.human_label, h.qtype, rownames=["reviewer"], colnames=["rule"]))
+    display(pd.crosstab(h.human_label, h.qtype, rownames=["label"], colnames=["rule"]))
 else:
-    print(f"PENDING: {human_path} not provided yet, so rule-vs-reviewer agreement is not computed")
+    print(f"PENDING: {human_path} not provided yet, so rule-vs-label agreement is not computed")
 
 real_calc_ok = read_verified("real_calc_verified.csv", "qid")
 print("real calculation items:", int((df.qtype == "calculation").sum()),
-      "| reviewer-verified:", "pending" if real_calc_ok is None else len(real_calc_ok))
+      "| verified:", "pending" if real_calc_ok is None else len(real_calc_ok))
 
 # %% [markdown]
 # ### 3.6 Derived calculation questions
 #
-# Only 48 real questions need arithmetic, which is too few to compare systems on calculation. We therefore
-# derive more from the same knowledge base:
-# 1. **Pick passages.** Short passages (under 600 characters) with at least two money amounts (a `$` sign or a
-#    million/billion word). These are not the source passage of any real calculation or unexplained question.
-# 2. **Write a question.** `phi4-mini` writes one question needing one arithmetic step, and returns the
-#    operation and the two operands **copied verbatim** in a schema-constrained JSON output (the structured
-#    generation pattern from the Module 2 lab). It is not the agent model, so the agent never answers its own
-#    questions.
-# 3. **Reject bad items.** Code rejects an item if an operand is not in the passage verbatim, does not parse to
-#    exactly one number, or mixes percentages with amounts. It also rejects items whose result is already
-#    stated in the passage or question, since that would be a lookup.
-# 4. **Compute the gold answer in Python,** never by the LLM.
+# Only 48 real questions need arithmetic, too few to compare systems. We generate more from the same passages:
+# 1. Take passages under 600 characters with at least two money amounts, excluding source passages of real calculation or unexplained questions.
+# 2. `phi4-mini` writes a one-step question and returns the operation and both operands, copied verbatim, as schema-constrained JSON (Module 2 lab). It is a different model from the agent.
+# 3. Code rejects items whose operands are not verbatim in the passage, don't parse to one number, or mix percentages with amounts, and items whose result is already stated.
+# 4. Python computes the gold answer.
 #
-# Every derived item is labelled `derived_calculation` and reported separately from real questions.
+# These are tagged `derived_calculation` and reported separately.
 
 # %%
 from typing import Literal
@@ -600,23 +565,22 @@ display(derived.operation.value_counts().rename("derived questions").to_frame())
 export_once(derived[["qid", "ticker", "question", "operation", "operand_a", "operand_b", "gold_answer", "context"]]
             .assign(verified="", note=""), "derived_calc_to_verify.csv")
 derived_ok = read_verified("derived_calc_verified.csv", "qid")    # applied in 3.7, after the split assignment
-print(f"derived calculation questions passing the automatic checks: {len(derived)}; reviewer-verified: "
+print(f"derived calculation questions passing the automatic checks: {len(derived)}; verified: "
       f"{'pending' if derived_ok is None else len(derived_ok & set(derived.qid))}")
 display(derived[["question", "operation", "operand_a", "operand_b", "gold_answer"]].head(5))
 
 # %% [markdown]
-# ### 3.7 Fixed dev / test subsets
+# ### 3.7 Dev and test splits
 #
-# All draws use `SEED`. The **dev** set is only for prompt iteration; every reported number comes from **test**.
+# All draws use `SEED`. Dev is only for prompt work. Every reported number is from test.
 #
 # | Split | Contents |
 # |---|---|
-# | test | 100 `text_lookup` + 100 `numeric_lookup` + **all** real `calculation` questions + all derived questions except 20 |
-# | dev | 15 `text_lookup` + 15 `numeric_lookup` + 20 derived questions. No real calculation question is used for dev, so all of them stay in test. |
-# | quick | 10 test questions per type. Used live when `QUICK_RUN = True`. |
+# | test | 100 `text_lookup`, 100 `numeric_lookup`, all real calculation questions, all derived questions except 20 |
+# | dev | 15 `text_lookup`, 15 `numeric_lookup`, 20 derived |
+# | quick | 10 test questions per type, run live when `QUICK_RUN = True` |
 #
-# Calculation items that the reviewer marks as wrong (3.5, 3.6) are removed **after** this assignment. A rejected
-# item therefore never pulls another question from dev into test; the type just has fewer questions.
+# Items rejected in 3.5 and 3.6 are removed after this assignment, so a rejection never moves a question between dev and test.
 
 # %%
 def real_rows(frame, kind):
@@ -654,13 +618,13 @@ for kind, g in questions[questions.split == "test"].groupby("qtype"):
     quick_ids |= set(g.sample(min(CONFIG["n_quick_per_type"], len(g)), random_state=SEED).qid)
 questions["quick"] = questions.qid.isin(quick_ids)
 
-# Items the reviewer rejected are dropped only now, after dev/test/quick were assigned, so verification never moves a
+# Rejected items are dropped only now, after dev/test/quick were assigned, so verification never moves a
 # question between dev and test.
 keep = pd.Series(True, index=questions.index)
 for kind, ok in (("calculation", real_calc_ok), ("derived_calculation", derived_ok)):
     if ok is not None:
         keep &= (questions.qtype != kind) | questions.qid.isin(ok)
-print(f"dropped {int((~keep).sum())} items that failed reviewer verification")
+print(f"dropped {int((~keep).sum())} items that failed verification")
 questions = questions[keep].reset_index(drop=True)
 
 (ART / "splits.json").write_text(json.dumps({s: sorted(g.qid) for s, g in questions.groupby("split")}, indent=1))
@@ -671,37 +635,26 @@ print(f"quick subset: {int(questions.quick.sum())} questions")
 # %% [markdown]
 # ## 4. Baseline
 #
-# ### 4.1 Evaluation harness (shared with section 6)
+# ### 4.1 Evaluation harness
 #
-# **Which questions are run.**
-#
-# | Flags | Questions | What happens |
+# | Flags | Questions | Behaviour |
 # |---|---|---|
-# | `QUICK_RUN = True` | the 40-question quick subset | missing predictions run live |
-# | `QUICK_RUN = False`, `USE_CACHED_PREDS = True` | the full test set | loaded from `artifacts/preds/` and re-scored here; missing predictions raise an error |
-# | `QUICK_RUN = False`, `USE_CACHED_PREDS = False` | the full test set | missing predictions run live (hours on a laptop GPU) |
+# | `QUICK_RUN = True` | 40-question quick subset | missing predictions run live |
+# | `QUICK_RUN = False`, `USE_CACHED_PREDS = True` (default) | full test set | re-scored from `artifacts/preds/`; a missing prediction raises an error |
+# | `QUICK_RUN = False`, `USE_CACHED_PREDS = False` | full test set | missing predictions run live (hours on a laptop GPU) |
 #
-# Predictions and judge verdicts are stored per condition and per model, one JSON line per question, so a run
-# can stop and resume.
+# Predictions and judge verdicts are saved one JSON line per question.
 #
-# **Metrics**
-# - **Judge accuracy.** A verdict is correct only if all three checks pass, in this order:
-#   1. **Not a refusal.** "The filing does not contain…" is never correct, because every gold answer exists.
-#   2. **Number check (rules).** For numeric-lookup questions, at least one gold figure must appear in the answer.
-#      For calculation questions, every gold figure must appear.
-#   3. **LLM judge.** `phi4-mini`, from a different family than the agent, compares the meaning with a strict
-#      rubric.
+# **Judge accuracy.** An answer is correct only if it passes three checks in order:
+# 1. It is not a refusal. Every gold answer exists, so "the filing does not say" is wrong.
+# 2. Number rule. Numeric lookups must contain at least one gold figure; calculation answers must contain all of them.
+# 3. `phi4-mini` compares meaning with a strict rubric.
 #
-#   On real answers the LLM judge alone said YES to refusals and to wrong figures, such as "$138.0M" against a gold
-#   "$132.4M" (dev check, logbook 2026-10-28). That is why the rule checks run first. Section 6 validates the
-#   combined verdict against reviewer labels.
-# - **Numeric accuracy** (calculation questions): every gold number must appear in the answer within 1%, either at
-#   its exact value or as rounded in the gold answer text (exact 0.963%, gold "1.0%", answer "1%"). Answers
-#   written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`. The scale (thousand / million / billion)
-#   is checked only when both the answer and the gold state one: "$1,318 million" matches a gold "$1,318.0" taken
-#   from a table in millions. The sign is ignored, because answers phrase decreases in words.
-# - **Calculator use**, **citation accuracy** (the cited passage is a relevant one), and **cost** (seconds, LLM
-#   calls and tokens per question).
+# On dev, `phi4-mini` alone accepted refusals and wrong figures ("$138.0M" for a gold "$132.4M"), which is why the rule checks run first.
+#
+# **Numeric accuracy** (calculation questions). Every gold number must appear within 1%, exactly or as rounded in the gold text. Answers written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`. Scale words are compared only when both sides have one, and the sign is ignored because decreases are written in words.
+#
+# We also report calculator use, citation accuracy (the cited passage is relevant) and cost: seconds, LLM calls and tokens per question.
 
 # %%
 eval_q = questions[(questions.split == "test") & (questions.quick | (not QUICK_RUN))].reset_index(drop=True)
@@ -859,10 +812,9 @@ def answer_from_llm(llm, prompt):
                                  "input_tokens": u.get("input_tokens", 0), "output_tokens": u.get("output_tokens", 0)}
 
 # %% [markdown]
-# ### 4.2 Baseline B0: closed-book LLM
+# ### 4.2 Baseline B0: closed book
 #
-# This is the simplest system in the brief: the agent model answers from its own knowledge, with no retrieval and
-# no tools. It shows how much the model "knows" about these filings on its own.
+# The agent model answers from memory, with no retrieval and no tools.
 
 # %%
 agent_llm = get_llm(CONFIG["agent_model"], num_ctx=CONFIG["agent_num_ctx"])
@@ -885,26 +837,16 @@ display(scored["B0_closed_book"].groupby("qtype")[["judge_ok", "numeric_ok"]].me
 #
 # ### 5a. Retrieval: hybrid BM25 + dense with a ticker filter
 #
-# *Builds on the Module 3 `RAG_Pipeline_Lab` (`bm25_search`, `rrf_fuse`, `hybrid_retrieve`, `rerank`,
-# `recall_at_k`, `mrr`) and on `Agentic_app/relay_ops/rag.py` from Module 4.*
+# Adapted from the Module 3 RAG lab and `Agentic_app/relay_ops/rag.py` (Module 4).
 #
-# Two retrievers rank the passages:
-# - **BM25** scores word overlap, weighted by how rare each word is. It catches exact tokens such as tickers, line
-#   items ("Data Center revenue") and figures.
-# - **Dense retrieval** compares sentence embeddings (`bge-small`), so it catches paraphrases.
+# BM25 catches exact tokens: tickers, line items, figures. Dense retrieval (`bge-small`) catches paraphrases. Reciprocal Rank Fusion merges the two lists by rank (score Σ 1/(60 + rank)), so the two score scales never have to be calibrated. A cross-encoder then re-scores the top 20.
 #
-# **Reciprocal Rank Fusion (RRF)** merges the two ranked lists by *rank*: each passage scores Σ 1/(60 + rank).
-# This means BM25 and cosine scores, which are on incomparable scales, never need calibrating against each other.
-# A **cross-encoder** then re-scores the top 20 fused passages by reading the query and passage *together*. That
-# is slower but more precise than comparing two separately computed embeddings.
-#
-# **Changes from the lab code:**
-# - Everything is keyed on `doc_id`. The lab keyed RRF and Recall on a parent `id` that chunks share.
-# - The BM25 tokenizer keeps numbers like `1,234.5` whole. The lab's `[a-z0-9]+` split them into `1`, `234`, `5`.
-# - bge queries get the model's retrieval instruction prefix.
-# - The **ticker filter is exact**: FAISS searches only that company's rows (`IDSelectorBatch`), and BM25 scores
-#   are masked to the same rows. Many questions say only "the Company", so without the filter they are ambiguous.
-# - Document embeddings are cached in `artifacts/cache/`.
+# Changes from the lab code:
+# - everything is keyed on `doc_id`
+# - the BM25 tokenizer keeps `1,234.5` as one token (the lab's split it into three)
+# - bge queries get the model's instruction prefix
+# - the ticker filter is exact: FAISS searches only that company's rows and BM25 is masked the same way. Many questions just say "the Company", so without it they are ambiguous.
+# - document embeddings are cached in `artifacts/cache/`
 
 # %%
 import faiss
@@ -996,9 +938,7 @@ for i, s in retrieve("What was total revenue in fiscal 2023?", ticker="NVDA", k=
     print(f"  {doc_ids[i]} [{doc_ticker[i]}] {s:6.2f}  {doc_text[i][:110]}")
 
 # %% [markdown]
-# **Retrieval measured on its own.** Each test question is the query and its relevant passages are the target.
-# We compute Recall@k (is a relevant passage in the top k?) and MRR@10 (the mean of 1/rank of the first relevant
-# passage) for every retriever, with the ticker filter on and off.
+# Retrieval on its own: each test question is the query, its relevant passages the target. Recall@k and MRR@10 for every retriever, ticker filter on and off.
 
 # %%
 RETRIEVERS = {"dense (MiniLM)": ("dense", dense_minilm), "dense (bge-small)": ("dense", dense_bge),
@@ -1046,29 +986,18 @@ display(test_q.assign(hit=hits5).groupby("qtype").hit.agg(["mean", "size"])
         .rename(columns={"mean": "R@5 (hybrid+rerank, filter on)", "size": "questions"}))
 
 # %% [markdown]
-# ### 5b. Tools: `search_filings` and a sandboxed `run_python`
+# ### 5b. Tools: `search_filings` and `run_python`
 #
-# *Builds on `Agentic_app/relay_ops/tools.py` from Module 4 (`run_python`, `search_knowledge_base`) and the PAL
-# cell of the Module 2 `Structured_Generation_Lab`.*
+# Adapted from `Agentic_app/relay_ops/tools.py` (Module 4) and the PAL cell of the Module 2 lab.
 #
-# **Program-of-thought.** The model writes the arithmetic as Python and an interpreter computes it, so no
-# multiplication is ever done "in tokens".
+# The model writes arithmetic as Python and an interpreter runs it. The lab's `run_python` called `exec` inside the agent process behind a banned-substring list, so `while True: pass` hung the agent, a name like `evaluation` was rejected for containing `eval`, and `rev = 1,234.5` silently became a tuple.
 #
-# The lab's `run_python` ran `exec` *inside* the agent's process and guarded it with banned substrings. That
-# design has three problems:
-# - `while True: pass` hangs the whole agent.
-# - Harmless names such as `evaluation` are rejected, because they contain `eval`.
-# - `rev = 1,234.5` silently builds a tuple.
+# Our version:
+# 1. Checks every syntax node against an allow-list: arithmetic, assignments, comparisons, `for`, comprehensions, f-strings, and calls to safe built-ins and `math.*`. Imports, `while`, `def`, `class`, `lambda` and other attributes are rejected.
+# 2. Strips thousands separators in number literals, turns a trailing expression into `answer = ...`, and runs the code in a separate `python -I` process with a 5 s timeout.
+# 3. Returns errors as text the agent can act on.
 #
-# Our version (design choice D5) instead:
-# 1. Parses the code and checks every syntax node against an **allow-list**. Allowed: arithmetic, assignments,
-#    comparisons, `for`, comprehensions, f-strings, and calls only to safe built-ins and `math.*`. Rejected:
-#    imports, `while`, function and class definitions, `lambda`, and any attribute other than `math.<name>`.
-# 2. Strips thousands separators inside number literals, rewrites a trailing expression to `answer = ...`, and
-#    runs the code in a **separate `python -I` process with a 5 s timeout**.
-# 3. Returns errors as text the agent can read and recover from, not as exceptions.
-#
-# This isolates hangs and crashes. It is *not* an OS-level security sandbox (see section 9).
+# This contains hangs and crashes. It is not an OS-level sandbox (section 9).
 
 # %%
 import ast
@@ -1189,12 +1118,9 @@ for code, expected in SANDBOX_TESTS.items():
 print(f"sandbox tests passed ({len(SANDBOX_TESTS)} cases)")
 
 # %% [markdown]
-# `search_filings` wraps the 5a retriever (hybrid + rerank, top 5). Each passage starts with its id, as in
-# `[D01234 | NVDA]`, so the agent can cite its source and we can measure in-system recall from the trace.
+# `search_filings` wraps the 5a retriever (hybrid + rerank, top 5). Each passage starts with its id, e.g. `[D01234 | NVDA]`, so the agent can cite it.
 #
-# The ticker the analyst selected is the default filter. A ticker the agent passes explicitly overrides it, and an
-# unknown ticker returns the list of valid ones. For the "ticker filter off" ablation, the tool ignores tickers
-# and searches every company.
+# The selected ticker is the default filter. A ticker the agent passes overrides it; an unknown one returns the valid list. In the "filter off" ablation the tool searches every company.
 
 # %%
 PASSAGE_ID_RE = re.compile(r"\[(D\d{5}) \|")
@@ -1233,35 +1159,18 @@ print(demo_search.invoke({"query": "total operating expenses 2023 2022"}))
 # %% [markdown]
 # ### 5b (continued). The ReAct agent in LangGraph
 #
-# *Builds on `build_react_agent` (`Agentic_app/relay_ops/graph.py`) and `ainvoke_requiring_tool` (`llm.py`) from
-# Module 4.*
+# Adapted from `build_react_agent` and `ainvoke_requiring_tool` in the Module 4 `Agentic_app`.
 #
-# **ReAct** alternates *reasoning* with *acting*: the model either calls a tool, whose result comes back as an
-# observation, or gives its final answer. Tools are called natively: Ollama returns structured `tool_calls`, so
-# no text needs parsing.
+# The model either calls a tool and reads the result, or answers. Ollama returns structured `tool_calls`, so nothing is parsed from text.
 #
-# The graph adds the following harness rules around the model:
-# - **Step limit.** `steps` counts model turns. Once it reaches `MAX_STEPS` (6), the `finalize` node makes the model
-#   answer from what it already retrieved, without tools. LangGraph's `recursion_limit` is a second backstop.
-# - **Tool errors.** These become observations (`ToolNode(handle_tool_errors=True)`), and the sandbox returns errors
-#   as text, so the agent can recover.
-# - **Guard node.** Before an answer is accepted, it checks two things and may nudge once each:
-#   1. *Search first.* No answering from memory. Ollama ignores `tool_choice`, so the harness enforces this; the
-#      rule comes from the lab.
-#   2. *Calculator check.* The draft answer contains a number and `run_python` was never called. The model is
-#      asked to compute the figure with the tool if
-#      - the number appears in no retrieved passage (so it was computed in the model's head), or
-#      - the question asks for a change, total, ratio or percentage (a keyword rule on the question). This catches
-#        answers that copy a figure the passage states but that answers a different question, for example a
-#        percentage of sales when the question asks for a percentage of cost. It also catches answers that list
-#        the two figures without combining them.
+# Harness rules:
+# - **Step limit.** After 6 model turns the `finalize` node makes the model answer from what it has, without tools.
+# - **Tool errors** come back as observations, so the agent can recover.
+# - **Guard node.** Before accepting an answer it may nudge once for each of two checks:
+#   1. No search yet. Ollama ignores `tool_choice`, so the harness enforces it.
+#   2. The answer has a number but `run_python` was never called, and either the number is in no retrieved passage (computed in the model's head) or the question asks for a change, total, ratio or percentage. On dev the model often answered the second kind of nudge with mental arithmetic, so the first kind may follow it.
 #
-#      Each nudge fires at most once. On dev, the model often answered the second nudge with mental arithmetic
-#      instead of a tool call, so the first nudge may follow it when the rewritten answer contains such a number.
-#      The Module 4 lab recorded the agent skipping the calculator. Both checks use only information available at
-#      answer time, never the gold answer.
-#
-# The prompt's worked example uses an invented company, so no test question leaks into it.
+# Both checks use only what is known at answer time, never the gold. The prompt's worked example uses a made-up company.
 
 # %%
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -1440,8 +1349,7 @@ def show_trace(rec):
           f"nudges {rec['nudges']}")
 
 # %% [markdown]
-# **The agent on dev questions.** These are 2 questions of each type, from dev only. This is where the prompt
-# and guards were checked; test questions are never used for tuning.
+# The agent on two dev questions of each type. Prompts and guards were tuned on dev only.
 
 # %%
 dev_q = questions[questions.split == "dev"]
@@ -1461,23 +1369,21 @@ display(pd.DataFrame(dev_runs))
 # %% [markdown]
 # ### 5c. Fine-tuning
 #
-# Not required by the brief, so nothing is fine-tuned. The system improves the model's behaviour through tools,
-# retrieval and harness rules instead.
+# Not required by the brief, and not done.
 
 # %% [markdown]
 # ## 6. Evaluation
 #
-# Every condition runs on the same evaluation set (4.1) with the same agent model, and is scored by the same judge
-# and numeric metric.
+# All conditions use the same questions, agent model, judge and numeric metric.
 #
-# | Condition | What it is |
+# | Condition | Description |
 # |---|---|
-# | **B0** closed-book | the model alone (section 4) |
-# | **B1** plain RAG | top 5 passages from 5a (hybrid + rerank, ticker filter), answered with the Module 3 RAG prompt |
-# | **B2** RAG + CoT | the same passages; the model reasons step by step and does the arithmetic in text |
-# | **S** full agent | ReAct with `search_filings` + `run_python` + guards |
-# | **A1** S, ticker filter off | the agent gets no ticker and searches every company |
-# | **A2** S, calculator off | the agent has only `search_filings` |
+# | B0 closed book | the model alone (4.2) |
+# | B1 plain RAG | top 5 passages from 5a, Module 3 RAG prompt |
+# | B2 RAG + CoT | same passages; the model reasons step by step and does arithmetic in text |
+# | S full agent | ReAct with `search_filings`, `run_python` and the guards |
+# | A1 no ticker filter | S searching every company |
+# | A2 no calculator | S with `search_filings` only |
 
 # %%
 RAG_PLAIN = """Answer the question using ONLY the passages below. If the answer is not in the passages, say "I don't have that information."
@@ -1569,11 +1475,7 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# **How sure are these numbers?** With a few hundred questions, a gap of a few points can be noise. We give each
-# accuracy a 95% bootstrap interval (10,000 resamples of the questions). Every condition answers the same questions,
-# so we compare S with each other condition **paired**: the interval is for the per-question difference, and the
-# p-value is McNemar's exact test on the questions where exactly one of the two is right. Questions without a
-# verdict are left out of a comparison.
+# A few hundred questions leave room for noise, so each accuracy gets a 95% bootstrap interval (10,000 resamples). Since every condition answers the same questions, S is compared with each other condition pairwise: a bootstrap interval on the per-question difference and McNemar's exact test on the questions only one of them got right.
 
 # %%
 from scipy.stats import binomtest
@@ -1642,13 +1544,9 @@ targets = pd.DataFrame([
 display(targets.round(3))
 
 # %% [markdown]
-# ### 6.1 Is the judge trustworthy?
+# ### 6.1 Judge validation
 #
-# A reviewer labels a stratified sample of answers from B1, B2 and S **blind** (without seeing the judge's
-# verdict). We then report agreement and Cohen's κ against the combined verdict and against the LLM judge alone.
-# Answers to calculation items rejected in 3.5/3.6 are left unlabelled, since those questions are no longer scored.
-# The labels are model-assisted (3.5), so this measures agreement with a careful second reader, not with
-# independent human judgment.
+# A stratified sample of answers from B1, B2 and S is labelled without seeing the judge's verdict (labels as in 3.5). We report agreement and Cohen's κ for the combined verdict and for `phi4-mini` alone. Answers to questions rejected in 3.5/3.6 are not labelled.
 
 # %%
 val_pool = pd.concat([scored[c].assign(condition=c) for c in ("B1_plain_rag", "B2_rag_cot", "S_agent")])
@@ -1670,18 +1568,15 @@ if val_path.exists():
                            "predictions no longer contain (the system changed after labelling): re-label them")
     for col in ("judge_ok", "llm_judge_ok"):
         ok = hv[col].notna()
-        print(f"{col:13s} vs reviewer on {int(ok.sum())} answers: agreement {np.mean(hv.human[ok] == hv[col][ok].astype(bool)):.1%}, "
+        print(f"{col:13s} vs labels on {int(ok.sum())} answers: agreement {np.mean(hv.human[ok] == hv[col][ok].astype(bool)):.1%}, "
               f"kappa {cohen_kappa_score(hv.human[ok], hv[col][ok].astype(bool)):.2f}")
 else:
-    print(f"PENDING: {val_path} not provided yet, so judge agreement with the reviewer is not computed")
+    print(f"PENDING: {val_path} not provided yet, so judge agreement is not computed")
 
 # %% [markdown]
-# ### 6.2 Stretch goal: self-consistency on calculation questions
+# ### 6.2 Self-consistency (stretch goal)
 #
-# **Self-consistency** samples several reasoning paths at temperature > 0 and takes a majority vote over their
-# answers. We run the full agent 3 times (T = 0.7, different seeds) on every calculation question and vote on the
-# answer's first figure, rounded to 3 significant digits. The run whose figure won supplies the final answer and
-# citation. Cost is the sum of all 3 runs.
+# The agent runs 3 times per calculation question (T = 0.7, different seeds). We vote on the first figure in each answer, rounded to 3 significant digits, and keep the winning run's answer and citation. Cost is the sum of the 3 runs.
 
 # %%
 def vote_key(answer):
@@ -1710,49 +1605,23 @@ sc_table = pd.DataFrame([{"condition": n, "judge acc": p.judge_ok.astype(float).
 display(sc_table.set_index("condition").round(3))
 
 # %% [markdown]
-# ### 6.3 What the results say
+# ### 6.3 Findings
 #
-# Test set after verification, n = 318 (200 lookups, 118 calculations: 42 real, 76 derived). The p-values are not
-# corrected for the 16 comparisons; read p ≈ 0.02–0.05 as a signal, not proof.
+# Test set after verification: 318 questions (200 lookups, 42 real and 76 derived calculations). p-values are not corrected for the 16 comparisons.
 #
-# - **Research question: no.** Overall, S is level with RAG + CoT (0.852 vs 0.849, paired difference +0.003,
-#   95% CI [−0.041, 0.047]) and with the agent without a calculator (A2, 0.855). It is ahead of plain RAG (+0.041),
-#   but that gap is not significant (p = 0.12).
-# - **Lookups: better than both baselines.** S 0.890 vs B1 0.825 (p = 0.05) and B2 0.835 (p = 0.05). The lookup
-#   target (within 3 points of B1) is met.
-# - **Calculations: worse than RAG + CoT.** Numeric accuracy S 0.805 vs B2 0.898 (−0.093, 95% CI [−0.169, −0.017],
-#   p = 0.03). The target of +15 points over B2 is clearly missed: writing the arithmetic out step by step in text
-#   did better than our agent on these questions.
-# - **The calculator is used too rarely to matter.** S calls it on 66% of calculation questions (target 90%), and
-#   removing it (A2) costs 4.2 points of numeric accuracy, which is within noise (p = 0.30). Section 7 shows why:
-#   the agent copies a rounded percentage the passage already states, adds in its head, or misreports the tool's
-#   result.
-# - **The ticker filter is the biggest single component.** Without it (A1), accuracy falls 20 points
-#   (0.852 → 0.654, p < 0.001): the agent answers from the wrong company's filing. (A1's latency in the table is
-#   inflated by a GPU-memory slowdown during that run, not by the condition.)
-# - **Self-consistency helps a little.** Three votes per calculation question raise numeric accuracy from 0.805 to
-#   0.839 at 2.9× the LLM calls and tokens.
-# - **Cost.** S makes about 3 LLM calls and uses about 3,100 tokens per question, against 1 call and 640 tokens for
-#   B2: roughly 5× the tokens for no overall gain.
-# - **The judge holds up.** Against the reviewer's labels (6.1) the combined verdict agrees on 93% of answers
-#   (κ = 0.73); the LLM judge alone on 89% (κ = 0.50), which is why the rule checks run first.
+# - Overall S is level with RAG + CoT: 0.852 vs 0.849 (difference +0.003, 95% CI −0.041 to 0.047), and with A2 (0.855). It is 4 points above plain RAG, which is not significant (p = 0.12). So the answer to the research question is no.
+# - On lookups S is best: 0.890 vs 0.825 (B1) and 0.835 (B2), p = 0.05 for both. The lookup target is met.
+# - On calculations S is worse than RAG + CoT: numeric accuracy 0.805 vs 0.898 (−0.093, CI −0.169 to −0.017, p = 0.03). The +15 point target is missed by a wide margin.
+# - The calculator is called on 66% of calculation questions (target 90%). Removing it costs 4 points, within noise (p = 0.30). Section 7 shows why.
+# - The ticker filter matters most. Without it accuracy drops 20 points (0.852 to 0.654, p < 0.001) because answers come from the wrong company. A1's latency is inflated by a GPU memory slowdown during that run.
+# - Self-consistency lifts numeric accuracy from 0.805 to 0.839 for 2.9× the calls and tokens.
+# - S uses about 3 calls and 3,100 tokens per question, B2 one call and 640 tokens.
+# - The combined judge agrees with the labels on 93% of answers (κ = 0.73); `phi4-mini` alone on 89% (κ = 0.50).
 
 # %% [markdown]
 # ## 7. Error Analysis
 #
-# The failures below are the full agent's (S) wrong answers. Each gets a first-pass category from its trace:
-# - **retrieval miss:** no search returned a relevant passage.
-# - **refused:** the right passage was retrieved, but the agent said the answer wasn't there.
-# - **calculator not called:** a calculation question answered without `run_python`.
-# - **wrong figure or formula:** the calculator was used, but on the wrong numbers or with the wrong operation.
-# - **wrong figure (lookup):** a lookup answer whose figure doesn't match the gold.
-# - **step limit:** the agent hit the step limit.
-# - **judge disagrees (text):** the rules passed but the LLM judge said no. This may be a wrong answer or a judge
-#   error.
-#
-# A reviewer checks every case, corrects the category where needed, and notes what we would change
-# (`failures_to_categorize__test.csv` → `failures_categorized__test.csv`; `__quick` files hold the quick subset's
-# failures).
+# Every wrong S answer gets an automatic category from its trace: retrieval miss, refused (the right passage was retrieved), calculator not called, wrong figure or formula, wrong figure (lookup), step limit, or judge disagrees (rules passed, LLM judge said no). Each case is then checked, re-categorised where needed and given a fix (`failures_to_categorize__test.csv` → `failures_categorized__test.csv`).
 
 # %%
 def auto_category(r):
@@ -1794,40 +1663,22 @@ else:
     print(f"PENDING: {cat_path} not provided yet")
 
 # %% [markdown]
-# **What the reviewed failures show** (47 of 318 S answers):
-# - **Not all are system errors.** 8 are ambiguous questions or gold answers (for example, a "percentage decrease"
-#   between two margins, where the gold gives the point change and the agent the relative change), and 6 answers are
-#   correct but marked wrong: a correct difference where the gold lists both values, or a ratio the gold rounds
-#   (1.014 vs 1.01). The true error rate of S is therefore somewhat below 15%.
-# - **The calculator path fails in three ways** (12 cases): it is not called (5; the agent copies a rounded
-#   percentage the passage states, or adds in its head), the wrong operands go in (4), or the tool's result is
-#   misreported (3; once the raw `run_python(...)` text became the final answer).
-# - **Reading errors** (13): the wrong passage or figure (8) and incomplete answers (5). Two of the incomplete
-#   answers come from the calculator nudge pushing a lookup question into arithmetic.
-# - **Search failures** (6): in 4 cases the agent never called `search_filings`, even after two nudges; in 2 the
-#   gold passage was not retrieved. 2 more answers refused although the right passage had been retrieved.
+# 47 of 318 S answers are wrong.
 #
-# **What we would change first:** force a search on the first step, run any arithmetic the final answer contains
-# through `run_python` (and execute tool-call text instead of returning it), and fire the calculator nudge only on
-# questions that ask for a number.
+# - 14 are not really system errors. 8 come from ambiguous questions or golds, e.g. a "percentage decrease" between two margins where the gold gives the point change and the agent the relative change. 6 are correct answers marked wrong, e.g. a correct difference where the gold lists both values, or 1.014 against a gold of 1.01.
+# - 12 are on the calculator path: not called (5, usually copying a rounded figure the passage states or adding in its head), wrong operands (4), or the tool result reported wrongly (3; once the raw `run_python(...)` call became the answer).
+# - 13 are reading errors: wrong passage or figure (8) and incomplete answers (5). Two of the incomplete ones happened because the calculator nudge pushed a lookup into arithmetic.
+# - 6 are search failures. In 4 the agent never searched despite two nudges; in 2 the gold passage wasn't retrieved. 2 more refused although the passage was there.
+#
+# First fixes: force a search on step one, send any arithmetic in the final answer through `run_python` and execute tool-call text instead of returning it, and only nudge for the calculator when the question asks for a number.
 
 # %% [markdown]
 # ## 8. Demo
 #
-# `ask(question, ticker)` runs the full system on one question and prints how it got there: every tool call, what
-# came back, the final answer and the cited passage.
+# `ask(question, ticker)` runs the full system and prints each tool call, its result, the answer and the cited passage. Both examples are dev questions picked before any test result was seen. A live run can differ (section 9).
 #
-# Both examples are **dev** questions, chosen before any test result was looked at. They behaved the same way in
-# every dev run, but a live run can still differ (section 9, run-to-run variation).
-#
-# 1. **Success.** Hasbro's goodwill impairment plus loss on disposal (gold: **$1,499.0 million**). The model adds
-#    $960.0M + $539.0M in its head and writes "$1,500.0 million". The calculator check sees a number that no passage
-#    states, `run_python` returns 1,499, and the answer is corrected.
-# 2. **Honest failure.** How much did NVIDIA's Compute & Networking gross margin decrease? The filing gives only
-#    the reason, not a figure (gold: *it decreased, primarily because of inventory provisions*). The agent finds that
-#    passage, but answers "decreased by 36%", a number taken from the segment revenue table: 36% is the revenue
-#    *growth*. Even the calculator nudge does not change it. A small model under a "how much" question prefers a
-#    wrong number to no number, and the citation is the only thing that lets a reader catch it.
+# 1. Success. Hasbro's goodwill impairment plus loss on disposal (gold $1,499.0 million). The model adds $960.0M and $539.0M in its head and writes $1,500.0 million. The guard sees a number no passage states, `run_python` returns 1,499 and the answer is fixed.
+# 2. Failure. How much did NVIDIA's Compute & Networking gross margin decrease? The filing gives only the reason (inventory provisions), not a figure. The agent finds the passage but answers "decreased by 36%", which is the segment's revenue growth. The calculator nudge doesn't change it. Asked "how much", the model would rather give a wrong number than none, and only the citation lets a reader catch it.
 
 # %%
 def ask(question: str, ticker: str = None):
@@ -1847,68 +1698,22 @@ demo_failure = ask("How much did the Compute & Networking segment's gross margin
                    ticker="NVDA")
 
 # %% [markdown]
-# ## 9. Limitations & Ethics
+# ## 9. Limitations and Ethics
 #
-# - **Where it fails.** See section 7.
-#   - Small models still pick the wrong figure from a passage: the wrong year, the wrong line item, or thousands
-#     read as millions. The calculator removes arithmetic slips but not extraction slips. The Program-of-Thoughts
-#     error analysis found the same.
-#   - Retrieval misses happen when a question says only "the company" and the passage words things differently.
-#   - Without the ticker filter, answers can silently come from another company.
-# - **Data limits.** The Q&A pairs were generated by an LLM from one 2023 10-K per company: 69 mostly large US
-#   companies. About 50 gold answers state facts that are not in their passage (the "unexplained" bucket, 3.4).
-#   The derived calculation questions are synthetic, although every gold value is computed by code and checked by a
-#   reviewer; about half (82 of 169) were rejected as not sensible or wrong. Results may not transfer to full
-#   filings, other years, tables, or smaller companies.
-# - **Who could be harmed.** An analyst or investor who trusts a confidently stated but wrong figure. Every answer
-#   cites its passage so it can be checked. The system is a reading aid, **not financial advice**.
-# - **Security.** The calculator runs model-written code. The allow-list and the separate process stop imports,
-#   file access and hangs, but this is not an OS-level sandbox, and a production system would need containers.
-#   Retrieved passages could carry prompt-injection text; we treat passage text only as data in the prompt, but a
-#   4B model can still be steered by it.
-# - **Privacy and misuse.** 10-K filings are public, and no personal data is processed. The same pipeline could be
-#   used to produce authoritative-looking but wrong financial summaries at scale, which is another reason the
-#   citation is part of every answer.
-# - **Evaluation limits.** Each condition was run once on 397 questions, so differences of a few points are within
-#   noise (see the intervals in 6). The judge is a small LLM, checked against model-assisted reviewer labels (6.1),
-#   not independent human labels. Numeric matching uses a
-#   1% tolerance, ignores the sign, and cannot check the scale when the gold answer has none (a gold "$1.60" is
-#   matched by "$1.60 billion"). Full-test-set numbers come from cached runs (4.1).
-# - **Run-to-run variation.** Ollama at temperature 0 with a fixed seed is not fully deterministic across runs or
-#   GPUs. The dev question on Coca-Cola's interest paid in 2022 and 2023 was answered correctly in some runs and
-#   wrongly in others, sometimes within the same notebook run (the model mixed in *interest expense* from the
-#   neighbouring passage). A fresh live run can differ by a few questions, so the reported numbers are the saved
-#   predictions.
+# - **Failures** (section 7). The model still picks the wrong figure: wrong year, wrong line item, thousands read as millions. The calculator fixes arithmetic, not extraction, which matches the Program-of-Thoughts error analysis. Questions that only say "the company" are hard to retrieve for, and without the ticker filter answers can come from another company.
+# - **Data.** The Q&A pairs were LLM-generated from one 2023 10-K for each of 69 mostly large US companies. About 50 gold answers contain facts not in their passage. The derived questions are synthetic, and 82 of 169 were rejected on review. Results may not carry over to full filings, other years, tables or smaller firms.
+# - **Harm.** A user could trust a confident wrong figure. Every answer cites its passage. This is a reading aid, not financial advice.
+# - **Security.** The calculator runs model-written code. The allow-list and separate process block imports, file access and hangs, but a production system would need a container. Passages could carry prompt injections; a 4B model can be steered by them.
+# - **Privacy and misuse.** Filings are public and no personal data is used. The same pipeline could mass-produce plausible but wrong financial summaries, another reason for citations.
+# - **Evaluation.** Each condition was run once on 318 questions, so small gaps are noise (6). The judge is a small LLM checked against the 3.5 labels. Numeric matching has a 1% tolerance, ignores sign, and can't check scale when the gold has none (gold "$1.60" matches "$1.60 billion").
+# - **Run-to-run variation.** Ollama at T = 0 with a fixed seed is not fully deterministic. A dev question on Coca-Cola's interest paid was right in some runs and wrong in others. Reported numbers are the saved predictions.
 
 # %% [markdown]
 # ## 10. References
 #
-# - **Dataset:** `virattt/financial-qa-10K` (Hugging Face), revision `30e48b49ef40389cce6488b0bddef7d6f00f4c7a`.
-# - **Models:**
-#   - Qwen3-4B-Instruct-2507 (`qwen3:4b-instruct` in Ollama), the agent and baselines.
-#   - Phi-4-mini-instruct (`phi4-mini`), the judge and the derived-question generator.
-#   - BAAI/bge-small-en-v1.5 and sentence-transformers/all-MiniLM-L6-v2 (embeddings).
-#   - cross-encoder/ms-marco-MiniLM-L-6-v2 (re-ranker).
-# - **Papers:**
-#   - Yao et al. 2023, *ReAct*.
-#   - Chen et al. 2023, *Program of Thoughts Prompting*.
-#   - Gao et al. 2023, *PAL*.
-#   - Wang et al. 2023, *Self-Consistency*.
-#   - Chen et al. 2021, *FinQA*.
-#   - Zhu et al. 2021, *TAT-QA*.
-#   - Islam et al. 2023, *FinanceBench*.
-#   - Cormack et al. 2009, *Reciprocal Rank Fusion*.
-#   - Robertson & Zaragoza 2009, *BM25*.
-#   - Xiao et al. 2023, *C-Pack / BGE*.
-#   - Zheng et al. 2023, *Judging LLM-as-a-Judge*.
-# - **Course labs reused:**
-#   - Module 2 `4_Structured_Generation_Lab` (PAL / program-of-thought, self-consistency, schema-constrained
-#     output).
-#   - Module 3 `1_RAG_Pipeline_Lab` (BM25, RRF, cross-encoder re-ranking, Recall@k / MRR).
-#   - Module 4 `1_Multi_Agent_System_End_to_End` and `Agentic_app` (tools, `run_python`, the ReAct graph, the
-#     require-a-tool nudge, `check_setup.py`).
-#   - Module 4 MCP lab (the AST calculator idea).
-# - **Tools:** Ollama, LangGraph, LangChain, FAISS, rank-bm25, sentence-transformers, Hugging Face `datasets`,
-#   pandas, matplotlib, jupytext.
-# - **AI assistance:** <!-- TODO(Vyom): write the AI-assistance disclosure required by the course Integrity rule -->
-#   *to be written by the team.*
+# - Dataset: `virattt/financial-qa-10K` (Hugging Face), revision `30e48b49ef40389cce6488b0bddef7d6f00f4c7a`.
+# - Models: Qwen3-4B-Instruct-2507 (`qwen3:4b-instruct`, agent and baselines); Phi-4-mini-instruct (`phi4-mini`, judge and question generator); BAAI/bge-small-en-v1.5 and all-MiniLM-L6-v2 (embeddings); cross-encoder/ms-marco-MiniLM-L-6-v2 (re-ranker).
+# - Papers: Yao et al. 2023, ReAct. Chen et al. 2023, Program of Thoughts. Gao et al. 2023, PAL. Wang et al. 2023, Self-Consistency. Chen et al. 2021, FinQA. Zhu et al. 2021, TAT-QA. Islam et al. 2023, FinanceBench. Cormack et al. 2009, Reciprocal Rank Fusion. Robertson and Zaragoza 2009, BM25. Xiao et al. 2023, C-Pack (BGE). Zheng et al. 2023, Judging LLM-as-a-Judge.
+# - Course labs: Module 2 `4_Structured_Generation_Lab` (PAL, self-consistency, structured output); Module 3 `1_RAG_Pipeline_Lab` (BM25, RRF, re-ranking, Recall@k, MRR); Module 4 `1_Multi_Agent_System_End_to_End` and `Agentic_app` (tools, `run_python`, ReAct graph, tool nudge, `check_setup.py`); Module 4 MCP lab (AST calculator).
+# - Software: Ollama, LangGraph, LangChain, FAISS, rank-bm25, sentence-transformers, Hugging Face `datasets`, pandas, matplotlib, jupytext.
+# - AI assistants were used to help write code and to fill in the label files (3.5, 6.1, 7) under the team's supervision.
