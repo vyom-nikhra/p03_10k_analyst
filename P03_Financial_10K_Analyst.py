@@ -39,12 +39,23 @@
 # %% [markdown]
 # ## 2. Setup
 #
-# Runs on a laptop with [Ollama](https://ollama.com) or on Colab (T4). On Colab the cell after the config installs Ollama and pulls both models. On a laptop, run `ollama pull qwen3:4b-instruct` and `ollama pull phi4-mini` once.
+# ### 2.1 Packages
 #
-# `AGENT_MODEL`, `JUDGE_MODEL` and `OLLAMA_HOST` override the defaults. Long LLM jobs write one JSON line per item to `artifacts/`, so a stopped run resumes where it left off.
+# Only needed on Colab. On a laptop the same pinned versions come from `requirements.txt`.
 
 # %%
 # %pip install -q datasets==5.1.0 sentence-transformers==6.2.0 transformers==5.21.0 faiss-cpu==1.15.1 rank-bm25==0.2.2 scikit-learn==1.9.1 langgraph==1.2.18 langchain-core==1.7.0 langchain-ollama==1.1.0 pydantic==2.14.1 pandas==3.1.0 numpy==2.4.6 matplotlib==3.11.2
+
+
+# %% [markdown]
+# ### 2.2 Imports and configuration
+#
+# Seeds are fixed so every sample in the notebook is reproducible. Three flags control how much runs live:
+# - `QUICK_RUN = 1` evaluates a 40-question subset live.
+# - `USE_CACHED_PREDS = 1` (default) re-scores the full test set from saved predictions in `artifacts/`.
+# - `GENERATE_DERIVED = 1` lets the LLM write missing derived questions (3.7).
+#
+# `CONFIG` holds the dataset revision, the models and every number the pipeline uses. Environment variables override the models and the Ollama address.
 
 # %%
 import hashlib
@@ -71,15 +82,14 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-# Flags (environment variables override the defaults, so a full run can be started without editing the notebook)
-QUICK_RUN = os.environ.get("QUICK_RUN", "0") == "1"                # True: evaluate a small fixed sample live
-USE_CACHED_PREDS = os.environ.get("USE_CACHED_PREDS", "1") == "1"  # True: full set from artifacts/preds, no live runs
-GENERATE_DERIVED = os.environ.get("GENERATE_DERIVED", "0") == "1"   # True: let the LLM generate missing derived items
+QUICK_RUN = os.environ.get("QUICK_RUN", "0") == "1"
+USE_CACHED_PREDS = os.environ.get("USE_CACHED_PREDS", "1") == "1"
+GENERATE_DERIVED = os.environ.get("GENERATE_DERIVED", "0") == "1"
 IN_COLAB = "google.colab" in sys.modules
 
 CONFIG = {
     "dataset": "virattt/financial-qa-10K",
-    "dataset_revision": "30e48b49ef40389cce6488b0bddef7d6f00f4c7a",   # HF commit, pinned for reproducibility
+    "dataset_revision": "30e48b49ef40389cce6488b0bddef7d6f00f4c7a",
     "agent_model": os.environ.get("AGENT_MODEL", "qwen3:4b-instruct"),
     "judge_model": os.environ.get("JUDGE_MODEL", "phi4-mini"),
     "ollama_host": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
@@ -90,7 +100,7 @@ CONFIG = {
     "rrf_k": 60,
     "rerank_pool": 20,
     "max_steps": 6,
-    "agent_num_ctx": 8192,     # set explicitly: Ollama silently truncates prompts longer than the context window
+    "agent_num_ctx": 8192,
     "n_test_lookup_per_type": 100,
     "n_dev_lookup_per_type": 15,
     "n_dev_derived": 20,
@@ -107,6 +117,11 @@ for sub in ("cache", "labels", "derived", "preds", "judge"):
 print(f"python {sys.version.split()[0]} | torch {torch.__version__} | device {DEVICE} | colab {IN_COLAB}")
 print(json.dumps(CONFIG, indent=1))
 
+
+# %% [markdown]
+# ### 2.3 Ollama
+#
+# The agent and judge run locally through Ollama. On Colab this cell installs Ollama, starts the server and pulls both models. Everywhere else it checks that the server is up and both models are present, and stops with a clear message if not.
 
 # %%
 def ollama_version():
@@ -135,6 +150,12 @@ if missing:
     raise RuntimeError(f"Pull these Ollama models first: {missing}")
 print(f"Ollama {version} at {CONFIG['ollama_host']}; models ready: {CONFIG['agent_model']}, {CONFIG['judge_model']}")
 
+
+# %% [markdown]
+# ### 2.4 Helpers
+#
+# `get_llm` builds a chat model with fixed temperature and seed. `JsonlStore` is an append-only file keyed by id: every long LLM job writes one line per item, so a crashed run resumes where it stopped and a re-run reuses earlier results.
+
 # %%
 from langchain_ollama import ChatOllama
 
@@ -145,7 +166,6 @@ def get_llm(model, temperature=0.0, num_predict=512, seed=SEED, **kw):
 
 
 class JsonlStore:
-    """Append-only JSONL file keyed by row["id"], so long LLM jobs resume after a crash and re-runs reuse results."""
 
     def __init__(self, path):
         self.path = Path(path)
@@ -169,10 +189,13 @@ class JsonlStore:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.rows[row["id"]] = row
 
+
 # %% [markdown]
 # ## 3. Data
 #
-# `virattt/financial-qa-10K` has 7,000 question/answer pairs. Each comes with the 10-K passage it was written from and the company ticker. The unique passages form the knowledge base. Questions are only used for evaluation and are never indexed.
+# ### 3.1 Load the dataset
+#
+# `virattt/financial-qa-10K` has 7,000 question/answer pairs from the 2023 10-Ks of 69 companies. Each row has the question, the gold answer, the passage it was written from and the ticker. The revision is pinned so reruns see the same data. Each row gets a stable id `q<row>`.
 
 # %%
 from datasets import load_dataset
@@ -180,11 +203,14 @@ from datasets import load_dataset
 ds = load_dataset(CONFIG["dataset"], revision=CONFIG["dataset_revision"])["train"]
 print(ds)
 raw = ds.to_pandas()
-raw.insert(0, "qid", [f"q{i}" for i in range(len(raw))])   # stable ids: row position in the pinned revision
+raw.insert(0, "qid", [f"q{i}" for i in range(len(raw))])
 display(raw.head(3))
 
+
 # %% [markdown]
-# ### 3.1 Cleaning and exploration
+# ### 3.2 Cleaning and exploration
+#
+# Strip whitespace, drop rows with an empty field and exact duplicates, then look at the shape of the data: rows per company, the `filing` column (one value only, so no use as a filter), and word counts. Passages are short (median about 27 words), which matters for the next step.
 
 # %%
 df = raw.copy()
@@ -208,12 +234,13 @@ df.ticker.value_counts().plot.hist(bins=20, ax=axes[2], title="questions per tic
 plt.tight_layout()
 plt.show()
 
+
 # %% [markdown]
-# ### 3.2 Knowledge base
+# ### 3.3 Knowledge base
 #
-# One document per unique (ticker, passage). We don't chunk: passages are short (median about 27 words), and chunking would break the link between a question and its gold passage that Recall@k depends on.
+# Each unique (ticker, passage) becomes one document with an id `D00000`. We don't chunk: passages are already short, and chunking would break the link between a question and its gold passage that Recall@k depends on.
 #
-# Some passages are contained in others from the same company. Both then count as relevant for that question.
+# Some passages are contained in another passage from the same company. Both then count as relevant for that question, so retrieving either is a hit. The last line checks how many passages exceed the embedder's 512-token window.
 
 # %%
 from transformers import AutoTokenizer
@@ -240,16 +267,19 @@ for _, g in docs.groupby("ticker"):
 df["relevant_docs"] = df.gold_doc.map(lambda d: sorted(related[d]))
 
 emb_tokenizer = AutoTokenizer.from_pretrained(CONFIG["embedder"])
-n_tokens = docs.context.map(lambda t: len(emb_tokenizer(t, verbose=False)["input_ids"]) if len(t) > 1500 else 0)  # 512 tokens > 1500 chars
+n_tokens = docs.context.map(lambda t: len(emb_tokenizer(t, verbose=False)["input_ids"]) if len(t) > 1500 else 0)
 print(f"documents: {len(docs)} unique passages across {docs.ticker.nunique()} tickers")
 print(f"documents with a same-ticker near-duplicate: {sum(len(v) > 1 for v in related.values())}")
 print(f"questions whose relevant set has more than one passage: {int((df.relevant_docs.str.len() > 1).sum())}")
 print(f"passages longer than the embedder's 512-token window (tail truncated): {int((n_tokens > 512).sum())}")
 
+
 # %% [markdown]
-# ### 3.3 Number parsing
+# ### 3.4 Number parsing
 #
-# 10-K figures come as `$1,234.5 million`, `(6)%`, `-34.7%` or table values in thousands. The parser normalises these, skips dates, years, section references like `10(b)` and list markers like `1)`, and records the decimals shown so rounded answers can be matched. The tagger (3.4) and the numeric metric (6) both use it.
+# 10-K figures come as `$1,234.5 million`, `(6)%`, `-34.7%` or table values in thousands. `extract_numbers` turns text into a list of numbers with sign and scale applied, skipping dates, years, section references like `10(b)` and list markers like `1)`. It also records how many decimals were shown, so a rounded answer can be matched.
+#
+# `same_up_to_presentation` treats two numbers as equal if they differ only by a factor of 1,000 (a table in thousands vs text in millions). `matches_target` asks whether a computed value reproduces a parsed number. The asserts at the end pin the tricky cases.
 
 # %%
 MONTHS = (r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|"
@@ -263,16 +293,15 @@ SCALE = {"thousand": 1e3, "million": 1e6, "billion": 1e9, "bn": 1e9, "trillion":
 
 
 def extract_numbers(text):
-    """Numbers in `text` as dicts: value (signed, scale words applied), shown (as written), dec, pct, scaled."""
     out = []
     for m in NUM_RE.finditer(DATE_RE.sub(" ", text)):
         lp, minus, digits, rp, pct, scale = m.groups()
         if rp and not lp:
-            continue                                           # list marker such as "1)"
+            continue
         shown = float(digits.replace(",", ""))
         bare = not pct and not scale and "$" not in m.group(0) and "," not in digits and "." not in digits
         if bare and 1900 <= shown <= 2099:
-            continue                                           # a year
+            continue
         if minus or (lp and rp):
             shown = -shown
         out.append({"value": shown * SCALE.get((scale or "").lower(), 1.0), "shown": shown, "pct": bool(pct),
@@ -282,7 +311,6 @@ def extract_numbers(text):
 
 
 def same_up_to_presentation(a, b, rel=0.005):
-    """|a| and |b| agree within `rel`, allowing a 1000^k change of scale (tables in thousands vs text in millions)."""
     a, b = abs(a), abs(b)
     if a == 0 or b == 0:
         return a == b
@@ -290,11 +318,10 @@ def same_up_to_presentation(a, b, rel=0.005):
 
 
 def matches_target(target, x, rel=0.01):
-    """Does computed value x reproduce parsed number `target`, within `rel` or after rounding to target's precision?"""
     t = abs(target["value"])
     if t == 0:
         return abs(x) < 1e-9
-    unit = t / abs(target["shown"])                            # scale word multiplier of the target
+    unit = t / abs(target["shown"])
     for k in range(-3, 4):
         y = abs(x) * 1000.0 ** k
         if math.isclose(t, y, rel_tol=rel) or round(y / unit, target["dec"]) == round(abs(target["shown"]), target["dec"]):
@@ -315,19 +342,20 @@ assert same_up_to_presentation(74_203, 74.2e6) and not same_up_to_presentation(5
 assert matches_target(extract_numbers("about 31 percent")[0], 4 / 13 * 100)
 print("number parser tests passed")
 
+
 # %% [markdown]
-# ### 3.4 Question types
+# ### 3.5 Question types
 #
-# Each question is tagged by rule, and every calculation tag is checked arithmetically:
+# Every question is tagged by rule:
 #
 # | Type | Rule |
 # |---|---|
 # | `text_lookup` | the gold answer has no number other than dates |
-# | `numeric_lookup` | every number in the answer appears in the passage or question (allowing scale, sign, rounding) |
+# | `numeric_lookup` | every number in the answer appears in the passage or question |
 # | `calculation` | each new number in the answer comes from one operation on two passage numbers: a−b, a+b, a/b, a/b×100 or (a−b)/b×100 |
-# | `unexplained` | a new number no single operation produces, usually a gold answer with facts missing from the passage. Left out of the test set. |
+# | `unexplained` | a new number no single operation produces, usually a gold answer with facts missing from the passage; left out of the test set |
 #
-# Matches can be coincidental, so every real calculation item is checked and a sample of 100 tags is labelled blind (3.5).
+# `reproducible` tries every operation on every pair of passage numbers. Because the arithmetic has to reproduce the gold number, the rule also catches gold answers that are wrong. The cell prints the counts and three examples of each harder type.
 
 # %%
 def reproducible(target, pool):
@@ -361,16 +389,13 @@ for kind in ("calculation", "unexplained"):
     for r in df[df.qtype == kind].sample(3, random_state=SEED).itertuples():
         print(f"Q: {r.question}\nA: {r.answer}\nC: {r.context[:240]}\n")
 
+
 # %% [markdown]
-# ### 3.5 Label checks
+# ### 3.6 Label checks
 #
-# The notebook exports label files to `artifacts/labels/` once and reads the completed versions on later runs. The completed files were filled in with AI assistance under the team's supervision.
+# Rules can match by coincidence, so two files are exported for review: a blind sample of 100 questions (stratified, rule tag hidden) and every real calculation question. `export_once` never overwrites a file, and `read_verified` reads back the ids marked `yes`. The completed files were filled in with AI assistance under the team's supervision.
 #
-# | Export | Task | Completed file |
-# |---|---|---|
-# | `qtype_sample_to_label.csv` | 100 stratified rows, rule tag hidden. `human_label` = text_lookup, numeric_lookup, calculation or unexplained. | `qtype_human_labels.csv` |
-# | `real_calc_to_verify.csv` | every real calculation row. `verified` = yes if the gold is right and needs arithmetic. | `real_calc_verified.csv` |
-# | `derived_calc_to_verify.csv` | every derived question (3.6). `verified` = yes if the question makes sense and the gold is right. | `derived_calc_verified.csv` |
+# If the labelled sample is present, the cell reports how often the rule agrees with the labels and Cohen's κ (agreement corrected for chance).
 
 # %%
 LABELS = ART / "labels"
@@ -386,7 +411,6 @@ def export_once(frame, name):
 
 
 def read_verified(name, key):
-    """Ids marked verified == yes in a completed label file, or None if the file isn't there yet."""
     path = LABELS / name
     if not path.exists():
         return None
@@ -417,16 +441,13 @@ real_calc_ok = read_verified("real_calc_verified.csv", "qid")
 print("real calculation items:", int((df.qtype == "calculation").sum()),
       "| verified:", "pending" if real_calc_ok is None else len(real_calc_ok))
 
+
 # %% [markdown]
-# ### 3.6 Derived calculation questions
+# ### 3.7 Derived calculation questions
 #
-# Only 48 real questions need arithmetic, too few to compare systems. We generate more from the same passages:
-# 1. Take passages under 600 characters with at least two money amounts, excluding source passages of real calculation or unexplained questions.
-# 2. `phi4-mini` writes a one-step question and returns the operation and both operands, copied verbatim, as schema-constrained JSON (Module 2 lab). It is a different model from the agent.
-# 3. Code rejects items whose operands are not verbatim in the passage, don't parse to one number, or mix percentages with amounts, and items whose result is already stated.
-# 4. Python computes the gold answer.
+# Only 48 real questions need arithmetic, too few to compare systems. We generate more from the same passages.
 #
-# These are tagged `derived_calculation` and reported separately.
+# **3.7.1 Generator.** For each of five operations (difference, percent change, share of total, ratio, sum) there is a definition, an example phrasing and words the question must contain. `phi4-mini`, a different model from the agent, returns schema-constrained JSON: the question, the operation (fixed per call, so it can't drift to an easier one) and the two operands copied verbatim.
 
 # %%
 from typing import Literal
@@ -434,7 +455,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-OP_SPEC = {   # definition shown to the generator, example phrasing, and words the question must contain
+OP_SPEC = {
     "difference": ("operand_a minus operand_b, reported as a positive amount (operand_a is the later period or larger item)",
                    "By how much did X increase from 2022 to 2023?",
                    ("difference", "how much", "increase", "decrease", "more", "less", "change", "higher", "lower", "grow")),
@@ -451,7 +472,6 @@ OPS = {"difference": lambda a, b: abs(a - b), "sum": lambda a, b: a + b, "ratio"
 
 
 def derived_schema(op):
-    """Schema with `operation` fixed to one value: the generator cannot drift to an easier operation."""
 
     class DerivedQuestion(BaseModel):
         question: str = Field(description="One question that needs exactly this arithmetic step on two numbers "
@@ -478,8 +498,11 @@ The answer must NOT already be written in the passage. Refer to the company as "
 Copy operand_a and operand_b exactly as they are written in the passage."""
 
 
+# %% [markdown]
+# **3.7.2 Checks and the gold answer.** `check_derived` rejects an item if the question doesn't ask for its operation, an operand isn't verbatim in the passage or doesn't parse to one number, the operands are the same or of different kinds, or the result is already stated somewhere. Otherwise Python computes the gold value and formats it like the operands (`$1,031 million`, `12.5%`, `1.04`). The LLM never computes an answer.
+
+# %%
 def fmt_amount(r, a, b):
-    """Gold text for an amount, in the operands' style: keep their scale word unless the result is below one unit."""
     unit = max(SCALE.get(a["scale_word"], 1.0), SCALE.get(b["scale_word"], 1.0))
     while unit > 1 and abs(r) < unit:
         unit /= 1000
@@ -489,7 +512,6 @@ def fmt_amount(r, a, b):
 
 
 def check_derived(context, dq):
-    """Validate one generated item; return (gold value, gold answer text) or raise ValueError(reason)."""
     if not any(w in dq.question.lower() for w in OP_SPEC[dq.operation][2]):
         raise ValueError(f"question wording does not ask for a {dq.operation}")
     for o in (dq.operand_a, dq.operand_b):
@@ -528,6 +550,10 @@ def generate_derived(context, op):
     spec = OP_SPEC[op]
     return gen.invoke(DERIVE_PROMPT.format(context=context, operation=op, definition=spec[0], example=spec[1]))
 
+
+# %% [markdown]
+# **3.7.3 Run.** Candidate passages are short (under 600 characters), contain at least two money amounts, and are not the source of a real calculation or unexplained question. Operations are assigned in rotation so each gets about the same number of questions. Results are cached, so this cell only calls the LLM when `GENERATE_DERIVED = 1` and items are missing. Surviving items are exported for review.
+
 # %%
 excluded = set(df.loc[df.qtype.isin(["calculation", "unexplained"]), "gold_doc"])
 pool = docs[(docs.context.str.len() < 600) & (docs.context.map(money_count) >= 2) & ~docs.doc_id.isin(excluded)]
@@ -541,7 +567,7 @@ if todo and not GENERATE_DERIVED:
                        "set GENERATE_DERIVED = True (about 3 s per item) to generate them")
 if todo:
     t0 = time.time()
-    op_for = {d: OP_CYCLE[i % len(OP_CYCLE)] for i, d in enumerate(candidates.doc_id)}   # balance the operations
+    op_for = {d: OP_CYCLE[i % len(OP_CYCLE)] for i, d in enumerate(candidates.doc_id)}
     for i, r in enumerate(todo, 1):
         row = {"id": r.doc_id, "doc_id": r.doc_id, "ticker": r.ticker, "context": r.context,
                "requested_operation": op_for[r.doc_id]}
@@ -550,7 +576,7 @@ if todo:
             row.update(dq.model_dump())
             row["gold_value"], row["gold_answer"] = check_derived(r.context, dq)
             row["status"] = "ok"
-        except ValueError as e:              # failed validation or unparseable LLM output: recorded, not retried
+        except ValueError as e:
             row["status"] = f"rejected: {str(e).splitlines()[0][:80]}"
         derived_store.add(row)
         if i % 25 == 0:
@@ -559,28 +585,29 @@ if todo:
 raw_derived = pd.DataFrame([derived_store[d] for d in candidates.doc_id])
 display(raw_derived.status.value_counts().rename("items").to_frame())
 derived = raw_derived[raw_derived.status == "ok"].reset_index(drop=True)
-derived.insert(0, "qid", [f"x{d[1:]}_{hashlib.sha1(q.encode()).hexdigest()[:6]}"     # stable if regenerated
+derived.insert(0, "qid", [f"x{d[1:]}_{hashlib.sha1(q.encode()).hexdigest()[:6]}"
                           for d, q in zip(derived.doc_id, derived.question)])
 display(derived.operation.value_counts().rename("derived questions").to_frame())
 export_once(derived[["qid", "ticker", "question", "operation", "operand_a", "operand_b", "gold_answer", "context"]]
             .assign(verified="", note=""), "derived_calc_to_verify.csv")
-derived_ok = read_verified("derived_calc_verified.csv", "qid")    # applied in 3.7, after the split assignment
+derived_ok = read_verified("derived_calc_verified.csv", "qid")
 print(f"derived calculation questions passing the automatic checks: {len(derived)}; verified: "
       f"{'pending' if derived_ok is None else len(derived_ok & set(derived.qid))}")
 display(derived[["question", "operation", "operand_a", "operand_b", "gold_answer"]].head(5))
 
+
 # %% [markdown]
-# ### 3.7 Dev and test splits
+# ### 3.8 Dev and test splits
 #
-# All draws use `SEED`. Dev is only for prompt work. Every reported number is from test.
+# All draws use `SEED`. Dev is only for prompt work; every reported number is from test.
 #
 # | Split | Contents |
 # |---|---|
 # | test | 100 `text_lookup`, 100 `numeric_lookup`, all real calculation questions, all derived questions except 20 |
 # | dev | 15 `text_lookup`, 15 `numeric_lookup`, 20 derived |
-# | quick | 10 test questions per type, run live when `QUICK_RUN = True` |
+# | quick | 10 test questions per type, run live when `QUICK_RUN = 1` |
 #
-# Items rejected in 3.5 and 3.6 are removed after this assignment, so a rejection never moves a question between dev and test.
+# `gold_numbers` are the figures the numeric metric checks: for real calculation questions, only the numbers the passage doesn't already state. Items rejected in review are removed **after** the assignment, so a rejection never moves a question between dev and test. The splits are saved to `artifacts/`.
 
 # %%
 def real_rows(frame, kind):
@@ -604,8 +631,6 @@ parts += [der_order.iloc[:CONFIG["n_dev_derived"]].assign(split="dev"),
           der_order.iloc[CONFIG["n_dev_derived"]:].assign(split="test")]
 questions = pd.concat(parts, ignore_index=True)
 
-# Numbers the numeric-match metric (section 6) compares against: for real calculation questions, only the numbers
-# the passage does not already state; for everything else, every number in the gold answer.
 calc_gold = {r.qid: [n["value"] for n in extract_numbers(r.answer)
                      if not any(same_up_to_presentation(n["value"], p["value"]) for p in extract_numbers(r.context))]
              for r in df[df.qtype == "calculation"].itertuples()}
@@ -618,8 +643,6 @@ for kind, g in questions[questions.split == "test"].groupby("qtype"):
     quick_ids |= set(g.sample(min(CONFIG["n_quick_per_type"], len(g)), random_state=SEED).qid)
 questions["quick"] = questions.qid.isin(quick_ids)
 
-# Rejected items are dropped only now, after dev/test/quick were assigned, so verification never moves a
-# question between dev and test.
 keep = pd.Series(True, index=questions.index)
 for kind, ok in (("calculation", real_calc_ok), ("derived_calculation", derived_ok)):
     if ok is not None:
@@ -632,29 +655,13 @@ questions.to_json(ART / "questions.jsonl", orient="records", lines=True, force_a
 display(pd.crosstab(questions.qtype, questions.split, margins=True))
 print(f"quick subset: {int(questions.quick.sum())} questions")
 
+
 # %% [markdown]
-# ## 4. Baseline
+# ## 4. Evaluation Harness and Baseline
 #
-# ### 4.1 Evaluation harness
+# ### 4.1 Evaluation set and prediction cache
 #
-# | Flags | Questions | Behaviour |
-# |---|---|---|
-# | `QUICK_RUN = True` | 40-question quick subset | missing predictions run live |
-# | `QUICK_RUN = False`, `USE_CACHED_PREDS = True` (default) | full test set | re-scored from `artifacts/preds/`; a missing prediction raises an error |
-# | `QUICK_RUN = False`, `USE_CACHED_PREDS = False` | full test set | missing predictions run live (hours on a laptop GPU) |
-#
-# Predictions and judge verdicts are saved one JSON line per question.
-#
-# **Judge accuracy.** An answer is correct only if it passes three checks in order:
-# 1. It is not a refusal. Every gold answer exists, so "the filing does not say" is wrong.
-# 2. Number rule. Numeric lookups must contain at least one gold figure; calculation answers must contain all of them.
-# 3. `phi4-mini` compares meaning with a strict rubric.
-#
-# On dev, `phi4-mini` alone accepted refusals and wrong figures ("$138.0M" for a gold "$132.4M"), which is why the rule checks run first.
-#
-# **Numeric accuracy** (calculation questions). Every gold number must appear within 1%, exactly or as rounded in the gold text. Answers written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`. Scale words are compared only when both sides have one, and the sign is ignored because decreases are written in words.
-#
-# We also report calculator use, citation accuracy (the cited passage is relevant) and cost: seconds, LLM calls and tokens per question.
+# `eval_q` is the full test set, or the quick subset when `QUICK_RUN = 1`. `run_condition` loads saved predictions for a condition and only runs the missing ones. It stops if a cached prediction was made for different question text, and refuses to run live when `USE_CACHED_PREDS = 1`.
 
 # %%
 eval_q = questions[(questions.split == "test") & (questions.quick | (not QUICK_RUN))].reset_index(drop=True)
@@ -663,8 +670,7 @@ print(f"evaluation set: {'quick subset' if QUICK_RUN else 'full test set'}, {len
 display(eval_q.qtype.value_counts().rename("questions").to_frame())
 
 
-# Bump a version whenever that system's prompt or code changes. It is part of the cache file name, so predictions
-# made by an older version are never reused.
+# the version is part of the cache file name; bump it when a prompt or the graph changes
 BASELINE_VERSION, AGENT_VERSION = "v1", "v3"
 
 
@@ -675,7 +681,6 @@ def live_allowed(kind):
 
 
 def run_condition(name, answer_fn, version, qs=None):
-    """Predictions for one condition: cached rows are reused, missing ones are computed by answer_fn(row)."""
     qs = eval_q if qs is None else qs
     store = JsonlStore(ART / "preds" / f"{name}__{MODEL_TAG}__{version}.jsonl")
     stale = [r.qid for r in qs.itertuples() if r.qid in store and store[r.qid]["question"] != r.question]
@@ -692,6 +697,12 @@ def run_condition(name, answer_fn, version, qs=None):
     return pd.DataFrame([store[q] for q in qs.qid])
 
 
+# %% [markdown]
+# ### 4.2 LLM judge
+#
+# `phi4-mini`, from a different model family than the agent, compares each answer with the gold answer under a strict rubric and replies YES or NO. Verdicts are cached by a hash of (question, gold, answer), so an answer the judge has seen is never re-judged. `REFUSAL_RE` spots answers like "the filing does not say".
+
+# %%
 JUDGE_TEMPLATE = (
     "You grade answers to questions about company annual reports.\n"
     "Question: {q}\nGold answer: {gold}\nCandidate answer: {pred}\n\n"
@@ -700,7 +711,8 @@ JUDGE_TEMPLATE = (
     "rounding to the precision shown in the gold answer is fine. A different number, the opposite direction "
     "(increase vs decrease), different entities, or no answer means NO. Extra correct detail is fine.\n"
     "Reply with exactly one word: YES or NO.")
-JUDGE_VERSION = "strict-v1"     # part of the cache file name: changing the prompt must not reuse old verdicts
+# changing the judge prompt must not reuse old verdicts
+JUDGE_VERSION = "strict-v1"
 judge_llm = get_llm(CONFIG["judge_model"], num_predict=5)
 judge_store = JsonlStore(ART / "judge" / f"{CONFIG['judge_model'].replace(':', '-')}__{JUDGE_VERSION}.jsonl")
 REFUSAL_RE = re.compile(
@@ -721,7 +733,6 @@ def judge_key(question, gold, answer):
 
 
 def judge_condition(name, preds, qs=None):
-    """LLM verdicts, cached by (question, gold, answer): any answer the judge has seen before is not re-judged."""
     qs = eval_q if qs is None else qs
     answers = dict(zip(preds.id, preds.answer))
     keys = {r.qid: judge_key(r.question, r.gold_answer, answers[r.qid]) for r in qs.itertuples()}
@@ -734,10 +745,13 @@ def judge_condition(name, preds, qs=None):
     return {q: judge_store[k]["correct"] for q, k in keys.items()}
 
 
+# %% [markdown]
+# ### 4.3 Numeric accuracy
+#
+# For calculation questions, every gold number must appear in the answer within 1%, either exactly or as rounded in the gold text (exact 0.963%, gold "1.0%", answer "1%"). Answers written ×100 or ÷100 count, as in Program-of-Thoughts' `finqa_equal`. Scale words are compared only when the gold has one: "$1,318 million" matches a gold "$1,318.0" from a table in millions. The sign is ignored because decreases are written in words.
+
+# %%
 def numeric_correct(answer, gold_numbers, gold_answer):
-    """Every gold number appears in `answer` within 1%, either at its exact value or as rounded in the gold answer
-    (exact 0.963, gold text "1.0%", answer "1%"). A gold answer with no scale word (e.g. "$1,318.0" from a table in
-    millions) does not fix the scale, so then the answer's scale is not checked either."""
     preds = extract_numbers(answer)
     gold_shown = extract_numbers(gold_answer)
     gold_unscaled = not any(n["scaled"] for n in gold_shown)
@@ -765,13 +779,24 @@ assert numeric_correct("Services were 0.125 of revenue", [12.5], "12.5%")
 assert not numeric_correct("$5.2 billion", [5.2e6], "$5.2 million") and numeric_correct("$1,318 million", [1318.0], "$1,318.0")
 assert numeric_correct("It rose 1%", [0.9626], "1.0%") and not numeric_correct("about $1 billion", [1.4e9], "$1.4 billion")
 
+
+# %% [markdown]
+# ### 4.4 Scoring
+#
+# An answer counts as correct only if it passes three checks in order:
+# 1. It is not a refusal. Every gold answer exists, so refusing is wrong.
+# 2. The number rule: numeric lookups must contain at least one gold figure, calculation answers all of them.
+# 3. The LLM judge says YES.
+#
+# On dev, `phi4-mini` alone accepted refusals and wrong figures, which is why the rule checks run first. `score` also records calculator use, whether the cited passage is relevant, whether the gold passage was retrieved, and cost (seconds, LLM calls, tokens).
+
+# %%
 CALC_TYPES = ("calculation", "derived_calculation")
 assert REFUSAL_RE.search("The 2023 annual report does not contain information about it")
 assert REFUSAL_RE.search("I'm sorry, but there is no publicly available report") and not REFUSAL_RE.search("Revenue was $5 billion")
 
 
 def rule_gate(qtype, answer, gold_numbers, gold_answer):
-    """Checks that run before the LLM judge: (passed, reason it failed)."""
     if REFUSAL_RE.search(answer):
         return False, "refusal"
     if qtype in CALC_TYPES and not numeric_correct(answer, gold_numbers, gold_answer):
@@ -783,10 +808,9 @@ def rule_gate(qtype, answer, gold_numbers, gold_answer):
 
 
 def score(name, preds, qs=None):
-    """Per-question metrics for one condition, merged with the question table."""
     qs = eval_q if qs is None else qs
     verdicts = judge_condition(name, preds, qs)
-    p = qs.merge(preds.drop(columns="question").rename(columns={"id": "qid"}), on="qid")   # run_condition checked it
+    p = qs.merge(preds.drop(columns="question").rename(columns={"id": "qid"}), on="qid")
     p["condition"] = name
     gates = [rule_gate(t, a, g, ga) for t, a, g, ga in zip(p.qtype, p.answer, p.gold_numbers, p.gold_answer)]
     p["refusal"] = [why == "refusal" for _, why in gates]
@@ -811,10 +835,11 @@ def answer_from_llm(llm, prompt):
     return msg.content.strip(), {"latency_s": round(time.time() - t0, 2), "llm_calls": 1,
                                  "input_tokens": u.get("input_tokens", 0), "output_tokens": u.get("output_tokens", 0)}
 
+
 # %% [markdown]
-# ### 4.2 Baseline B0: closed book
+# ### 4.5 Baseline B0: closed book
 #
-# The agent model answers from memory, with no retrieval and no tools.
+# The agent model answers from memory, with no retrieval and no tools. This shows how much it knows about these filings on its own.
 
 # %%
 agent_llm = get_llm(CONFIG["agent_model"], num_ctx=CONFIG["agent_num_ctx"])
@@ -832,21 +857,16 @@ preds_b0 = run_condition("B0_closed_book", closed_book, BASELINE_VERSION)
 scored = {"B0_closed_book": score("B0_closed_book", preds_b0)}
 display(scored["B0_closed_book"].groupby("qtype")[["judge_ok", "numeric_ok"]].mean().round(3))
 
+
 # %% [markdown]
 # ## 5. System
 #
-# ### 5a. Retrieval: hybrid BM25 + dense with a ticker filter
+# ### 5.1 Retrieval indexes
 #
 # Adapted from the Module 3 RAG lab and `Agentic_app/relay_ops/rag.py` (Module 4).
 #
-# BM25 catches exact tokens: tickers, line items, figures. Dense retrieval (`bge-small`) catches paraphrases. Reciprocal Rank Fusion merges the two lists by rank (score Σ 1/(60 + rank)), so the two score scales never have to be calibrated. A cross-encoder then re-scores the top 20.
-#
-# Changes from the lab code:
-# - everything is keyed on `doc_id`
-# - the BM25 tokenizer keeps `1,234.5` as one token (the lab's split it into three)
-# - bge queries get the model's instruction prefix
-# - the ticker filter is exact: FAISS searches only that company's rows and BM25 is masked the same way. Many questions just say "the Company", so without it they are ambiguous.
-# - document embeddings are cached in `artifacts/cache/`
+# - **Dense**: passages are embedded with `bge-small` (and `MiniLM` for comparison) and searched by cosine similarity in FAISS. Embeddings are cached. With a ticker, FAISS searches only that company's rows.
+# - **BM25**: keyword scoring where rare words count more. The tokenizer keeps `1,234.5` as one token (the lab's split it into three). With a ticker, scores are masked to that company.
 
 # %%
 import faiss
@@ -872,7 +892,7 @@ class DenseIndex:
             emb = self.model.encode(doc_text, batch_size=64, normalize_embeddings=True,
                                     show_progress_bar=False).astype("float32")
             np.save(path, emb)
-        self.index = faiss.IndexFlatIP(emb.shape[1])     # exact inner product = cosine on normalised vectors
+        self.index = faiss.IndexFlatIP(emb.shape[1])
         self.index.add(emb)
 
     def search(self, query, k, ticker=None):
@@ -896,6 +916,12 @@ def bm25_search(query, k, ticker=None):
     return [(int(i), float(scores[i])) for i in top]
 
 
+# %% [markdown]
+# ### 5.2 Fusion, re-ranking and `retrieve`
+#
+# Reciprocal Rank Fusion merges the dense and BM25 lists by rank (each passage scores Σ 1/(60 + rank)), so their scores never have to be calibrated against each other. A cross-encoder then reads the query and each of the top 20 passages together and re-orders them. `retrieve` exposes all four methods; the cell ends with a sample query.
+
+# %%
 def rrf_fuse(*ranked_lists, k_const=CONFIG["rrf_k"]):
     scores = {}
     for ranked in ranked_lists:
@@ -919,7 +945,6 @@ dense_minilm = DenseIndex(CONFIG["embedder_baseline"])
 
 
 def retrieve(query, ticker=None, k=CONFIG["top_k"], method="hybrid_rerank", dense=dense_bge):
-    """Ranked [(row, score)]. method: dense | bm25 | hybrid | hybrid_rerank."""
     pool = CONFIG["rerank_pool"]
     if method == "dense":
         return dense.search(query, k, ticker)
@@ -937,8 +962,11 @@ print(f"indexed {len(doc_text)} passages; dense dims: bge {dense_bge.index.d}, M
 for i, s in retrieve("What was total revenue in fiscal 2023?", ticker="NVDA", k=3):
     print(f"  {doc_ids[i]} [{doc_ticker[i]}] {s:6.2f}  {doc_text[i][:110]}")
 
+
 # %% [markdown]
-# Retrieval on its own: each test question is the query, its relevant passages the target. Recall@k and MRR@10 for every retriever, ticker filter on and off.
+# ### 5.3 Retrieval on its own
+#
+# Each test question is the query and its relevant passages are the target. For every method, with the ticker filter on and off, we measure Recall@k (is a relevant passage in the top k?) and MRR@10 (the average of 1/rank of the first relevant passage). The last table breaks Recall@5 down by question type.
 
 # %%
 RETRIEVERS = {"dense (MiniLM)": ("dense", dense_minilm), "dense (bge-small)": ("dense", dense_bge),
@@ -985,19 +1013,13 @@ hits5 = pd.Series([h is not None and h < 5 for h in ret_hits[("hybrid RRF + rera
 display(test_q.assign(hit=hits5).groupby("qtype").hit.agg(["mean", "size"])
         .rename(columns={"mean": "R@5 (hybrid+rerank, filter on)", "size": "questions"}))
 
+
 # %% [markdown]
-# ### 5b. Tools: `search_filings` and `run_python`
+# ### 5.4 Calculator: checking the code
 #
-# Adapted from `Agentic_app/relay_ops/tools.py` (Module 4) and the PAL cell of the Module 2 lab.
+# Adapted from `Agentic_app/relay_ops/tools.py` (Module 4) and the PAL cell of the Module 2 lab. The lab's version ran `exec` inside the agent behind a banned-word list, so `while True: pass` hung the agent and `rev = 1,234.5` silently became a tuple.
 #
-# The model writes arithmetic as Python and an interpreter runs it. The lab's `run_python` called `exec` inside the agent process behind a banned-substring list, so `while True: pass` hung the agent, a name like `evaluation` was rejected for containing `eval`, and `rev = 1,234.5` silently became a tuple.
-#
-# Our version:
-# 1. Checks every syntax node against an allow-list: arithmetic, assignments, comparisons, `for`, comprehensions, f-strings, and calls to safe built-ins and `math.*`. Imports, `while`, `def`, `class`, `lambda` and other attributes are rejected.
-# 2. Strips thousands separators in number literals, turns a trailing expression into `answer = ...`, and runs the code in a separate `python -I` process with a 5 s timeout.
-# 3. Returns errors as text the agent can act on.
-#
-# This contains hangs and crashes. It is not an OS-level sandbox (section 9).
+# Here the code is parsed first and every syntax node checked against an allow-list: arithmetic, assignments, comparisons, `for`, comprehensions, f-strings, and calls to safe built-ins and `math.*`. Imports, `while`, `def`, `lambda` and other attributes are rejected. `prepare_code` also strips thousands separators and turns a final expression into `answer = ...`.
 
 # %%
 import ast
@@ -1043,8 +1065,8 @@ def check_sandbox_code(tree):
 
 def prepare_code(code):
     code = code.strip().strip("`").strip()
-    code = re.sub(r"^python\s*\n", "", code)                                  # tolerate ```python fences
-    code = re.sub(r"(?<![\w.])(\d{1,3}(?:,\d{3})+)(?![\d,])",                   # 1,234.5 -> 1234.5
+    code = re.sub(r"^python\s*\n", "", code)
+    code = re.sub(r"(?<![\w.])(\d{1,3}(?:,\d{3})+)(?![\d,])",
                   lambda m: m.group(1).replace(",", ""), code)
     tree = ast.parse(code)
     check_sandbox_code(tree)
@@ -1055,6 +1077,12 @@ def prepare_code(code):
     return ast.unparse(tree)
 
 
+# %% [markdown]
+# ### 5.5 Calculator: running the code
+#
+# The checked code runs in a separate `python -I` process with only the safe built-ins and a 5-second timeout. Errors come back as text the agent can read and fix. `run_python` is the tool the agent sees; its docstring is the description the model reads.
+
+# %%
 def fmt_number(x):
     if isinstance(x, float):
         if not math.isfinite(x):
@@ -1096,6 +1124,12 @@ def run_python(code: str) -> str:
     return run_python_code(code)
 
 
+# %% [markdown]
+# ### 5.6 Calculator tests
+#
+# Fourteen cases: normal arithmetic, thousands separators, f-strings, and attacks that must fail (imports, file access, dunder tricks, infinite loops, huge exponents).
+
+# %%
 SANDBOX_TESTS = {
     "answer = 52527 - 46921": "answer = 5,606",
     "52,527 - 46,921": "answer = 5,606",
@@ -1117,14 +1151,15 @@ for code, expected in SANDBOX_TESTS.items():
     assert got.startswith(expected), f"{code!r}: expected {expected!r}, got {got!r}"
 print(f"sandbox tests passed ({len(SANDBOX_TESTS)} cases)")
 
+
 # %% [markdown]
-# `search_filings` wraps the 5a retriever (hybrid + rerank, top 5). Each passage starts with its id, e.g. `[D01234 | NVDA]`, so the agent can cite it.
+# ### 5.7 Search tool
 #
-# The selected ticker is the default filter. A ticker the agent passes overrides it; an unknown one returns the valid list. In the "filter off" ablation the tool searches every company.
+# `search_filings` wraps `retrieve` (hybrid + rerank, top 5). Each passage starts with its id, e.g. `[D01234 | NVDA]`, so the agent can cite it. The question's ticker is the default filter; an unknown ticker returns the valid list; repeating the exact same search is refused, since looping on one query is a common ReAct failure. The three calls show a normal search, a bad ticker and a repeat.
 
 # %%
 PASSAGE_ID_RE = re.compile(r"\[(D\d{5}) \|")
-MAX_PASSAGE_CHARS = 2000      # only 2 passages are longer; keeps one search result well inside the context window
+MAX_PASSAGE_CHARS = 2000
 
 
 def make_search_tool(default_ticker=None, use_filter=True, k=CONFIG["top_k"]):
@@ -1135,7 +1170,7 @@ def make_search_tool(default_ticker=None, use_filter=True, k=CONFIG["top_k"]):
         """Search the 10-K filing passages. Give a short search query, plus the company ticker such as NVDA.
         Returns the most relevant passages. Each passage starts with its id in square brackets; cite that id."""
         key = (norm_text(query), (ticker or "").upper())
-        if key in seen:      # ReAct's most common failure is looping on the same search
+        if key in seen:
             return "You already ran this exact search. Use the passages above, or search with different words."
         seen.add(key)
         t = None
@@ -1156,21 +1191,13 @@ print(demo_search.invoke({"query": "total operating expenses 2023 2022"})[:700])
 print(demo_search.invoke({"query": "revenue", "ticker": "DELTA"}))
 print(demo_search.invoke({"query": "total operating expenses 2023 2022"}))
 
+
 # %% [markdown]
-# ### 5b (continued). The ReAct agent in LangGraph
+# ### 5.8 Agent prompt and nudges
 #
 # Adapted from `build_react_agent` and `ainvoke_requiring_tool` in the Module 4 `Agentic_app`.
 #
-# The model either calls a tool and reads the result, or answers. Ollama returns structured `tool_calls`, so nothing is parsed from text.
-#
-# Harness rules:
-# - **Step limit.** After 6 model turns the `finalize` node makes the model answer from what it has, without tools.
-# - **Tool errors** come back as observations, so the agent can recover.
-# - **Guard node.** Before accepting an answer it may nudge once for each of two checks:
-#   1. No search yet. Ollama ignores `tool_choice`, so the harness enforces it.
-#   2. The answer has a number but `run_python` was never called, and either the number is in no retrieved passage (computed in the model's head) or the question asks for a change, total, ratio or percentage. On dev the model often answered the second kind of nudge with mental arithmetic, so the first kind may follow it.
-#
-# Both checks use only what is known at answer time, never the gold. The prompt's worked example uses a made-up company.
+# The system prompt tells the model to search first, use `run_python` for any arithmetic, and finish with an `Answer:` line and a `Source:` line. Its worked example uses a made-up company, so no test question leaks in. The nudges are short messages the harness sends when the model breaks a rule. `CALC_INTENT_RE` spots questions that ask for a change, total, ratio or percentage.
 
 # %%
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -1231,13 +1258,22 @@ FINALIZE = ("Step limit reached. Do not call any tools. Give your best final ans
             "in the required two-line format.")
 
 
+# %% [markdown]
+# ### 5.9 Agent graph
+#
+# The LangGraph graph has four nodes:
+# - **agent**: the model either calls tools (returned as structured `tool_calls` by Ollama) or answers
+# - **tools**: runs the calls; errors come back as observations
+# - **finalize**: after 6 steps, makes the model answer without tools
+# - **guard**: checks a draft answer before accepting it. It nudges if the model never searched, or if the answer has a number but `run_python` was never called and either the number is in no retrieved passage or the question asks for a calculation. Each nudge fires at most once (search at most twice). The checks only use what is known at answer time, never the gold.
+
+# %%
 class AgentState(MessagesState):
     steps: int
     nudges: list
 
 
 def answer_numbers_unsupported(text, passages):
-    """Numbers in the draft answer that no retrieved passage states (up to presentation)."""
     pool = [n["value"] for p in passages for n in extract_numbers(p)]
     return [n["value"] for n in extract_numbers(text)
             if not any(same_up_to_presentation(n["value"], v) for v in pool)]
@@ -1272,8 +1308,6 @@ def build_agent(ticker=None, calculator=True, use_filter=True, guard=True, tempe
         if guard and not passages and nudges.count("search") < 2:
             return Command(goto="agent", update={"messages": [HumanMessage(NUDGE_SEARCH)], "nudges": nudges + ["search"]})
         draft = msgs[-1].content.split("Source:")[0]
-        # Each calculator nudge fires at most once. "calc" may follow "calc_question": the model often answers that
-        # nudge with mental arithmetic, which then shows up as an unsupported number.
         if guard and calculator and not used_calc and passages and extract_numbers(draft):
             if "calc" not in nudges and answer_numbers_unsupported(draft, passages):
                 return Command(goto="agent", update={"messages": [HumanMessage(NUDGE_CALC)], "nudges": nudges + ["calc"]})
@@ -1294,12 +1328,17 @@ def build_agent(ticker=None, calculator=True, use_filter=True, guard=True, tempe
     return g.compile()
 
 
+# %% [markdown]
+# ### 5.10 Running the agent
+#
+# `run_agent` builds the graph for one question, runs it, and returns the answer, the cited passage, every tool call, the retrieved passage ids, nudges, LLM calls, tokens and time. The cell prints the graph in Mermaid form; `show_trace` prints a run step by step.
+
+# %%
 ANSWER_RE = re.compile(r"Answer:\s*(.+?)(?:\n\s*Source:|$)", re.S)
 SOURCE_RE = re.compile(r"Source:\s*\[?\s*(D\d{5})")
 
 
 def run_agent(question, ticker=None, **agent_kw):
-    """Run the agent on one question; return the parsed answer plus everything the evaluation needs."""
     app = build_agent(ticker=ticker, **agent_kw)
     user = f"Company ticker: {ticker}\nQuestion: {question}" if ticker and agent_kw.get("use_filter", True) else question
     t0 = time.time()
@@ -1348,8 +1387,11 @@ def show_trace(rec):
     print(f"-> answer: {rec['answer']} | cited {rec['cited_doc']} | {rec['latency_s']}s, {rec['llm_calls']} LLM calls, "
           f"nudges {rec['nudges']}")
 
+
 # %% [markdown]
-# The agent on two dev questions of each type. Prompts and guards were tuned on dev only.
+# ### 5.11 Agent on dev questions
+#
+# Two dev questions of each type, run live, with full traces. Prompts and guards were tuned on dev only. A live run can differ slightly from earlier runs (section 9).
 
 # %%
 dev_q = questions[questions.split == "dev"]
@@ -1366,24 +1408,29 @@ for r in dev_sample.itertuples():
     show_trace(rec)
 display(pd.DataFrame(dev_runs))
 
+
 # %% [markdown]
-# ### 5c. Fine-tuning
+# ### 5.12 Fine-tuning
 #
 # Not required by the brief, and not done.
 
 # %% [markdown]
 # ## 6. Evaluation
 #
-# All conditions use the same questions, agent model, judge and numeric metric.
+# ### 6.1 Conditions
+#
+# All conditions use the same questions, agent model, judge and metrics.
 #
 # | Condition | Description |
 # |---|---|
-# | B0 closed book | the model alone (4.2) |
-# | B1 plain RAG | top 5 passages from 5a, Module 3 RAG prompt |
-# | B2 RAG + CoT | same passages; the model reasons step by step and does arithmetic in text |
-# | S full agent | ReAct with `search_filings`, `run_python` and the guards |
+# | B0 closed book | the model alone (4.5) |
+# | B1 plain RAG | top 5 passages from `retrieve`, Module 3 RAG prompt |
+# | B2 RAG + CoT | same passages; the model quotes the figures and does the arithmetic step by step in text |
+# | S full agent | ReAct with `search_filings`, `run_python` and the guard |
 # | A1 no ticker filter | S searching every company |
 # | A2 no calculator | S with `search_filings` only |
+#
+# The cell defines the two RAG prompts, then runs (or loads) and scores every condition.
 
 # %%
 RAG_PLAIN = """Answer the question using ONLY the passages below. If the answer is not in the passages, say "I don't have that information."
@@ -1427,7 +1474,7 @@ def agent_condition(**kw):
     return lambda r: run_agent(r.question, r.ticker, **kw)
 
 
-CONDITIONS = {   # name: (answer function, version of the system that produced the cached predictions)
+CONDITIONS = {
     "B0_closed_book": (closed_book, BASELINE_VERSION),
     "B1_plain_rag": (lambda r: rag_answer(r, RAG_PLAIN), BASELINE_VERSION),
     "B2_rag_cot": (lambda r: rag_answer(r, RAG_COT), BASELINE_VERSION),
@@ -1440,13 +1487,19 @@ for name, (fn, version) in CONDITIONS.items():
         scored[name] = score(name, run_condition(name, fn, version))
 print("scored:", list(scored))
 
+
+# %% [markdown]
+# ### 6.2 Results
+#
+# One row per condition: judge accuracy overall and by question type, numeric accuracy on calculations, calculator use, whether the gold passage was retrieved, citation accuracy, refusal rate and cost. The chart shows judge accuracy by question type.
+
 # %%
 TYPE_ORDER = ["text_lookup", "numeric_lookup", "calculation", "derived_calculation"]
 HAS_TOOLS = {"S_agent", "A1_agent_no_ticker_filter", "A2_agent_no_calculator"}
 
 
 def summarize(name, p):
-    acc = lambda s: s.astype(float).mean()          # None (no verdict) is excluded from the mean
+    acc = lambda s: s.astype(float).mean()
     calc, look = p[p.qtype.isin(CALC_TYPES)], p[~p.qtype.isin(CALC_TYPES)]
     row = {"condition": name, "judge acc": acc(p.judge_ok)}
     row |= {f"judge: {t}": acc(p.loc[p.qtype == t, "judge_ok"]) for t in TYPE_ORDER}
@@ -1474,8 +1527,11 @@ ax.tick_params(axis="x", rotation=20)
 plt.tight_layout()
 plt.show()
 
+
 # %% [markdown]
-# A few hundred questions leave room for noise, so each accuracy gets a 95% bootstrap interval (10,000 resamples). Since every condition answers the same questions, S is compared with each other condition pairwise: a bootstrap interval on the per-question difference and McNemar's exact test on the questions only one of them got right.
+# ### 6.3 Uncertainty and paired tests
+#
+# With a few hundred questions, a gap of a few points can be noise. Each accuracy gets a 95% bootstrap interval (10,000 resamples of the questions). Since every condition answers the same questions, S is compared with each other condition pairwise: a bootstrap interval on the per-question difference, and McNemar's exact test on the questions only one of the two got right. The last table checks the targets from section 1.
 
 # %%
 from scipy.stats import binomtest
@@ -1485,14 +1541,12 @@ boot_rng = np.random.default_rng(SEED)
 
 
 def in_group(p, group):
-    """'lookup' = text + numeric lookups; 'calculation' = real + derived calculations."""
     if group == "all":
         return p
     return p[p.qtype.isin(CALC_TYPES)] if group == "calculation" else p[~p.qtype.isin(CALC_TYPES)]
 
 
 def outcome(p, col):
-    """0/1 per qid, verdict-less rows dropped."""
     s = p.set_index("qid")[col]
     return s[s.notna()].astype(float)
 
@@ -1530,7 +1584,6 @@ for other in ("B2_rag_cot", "B1_plain_rag", "A2_agent_no_calculator", "A1_agent_
 paired = pd.DataFrame(paired_rows).set_index(["S vs", "metric"])
 display(paired)
 
-# The success targets of section 1, fixed before any test result
 r5 = retrieval_table.set_index(["retriever", "ticker filter"]).loc[("hybrid RRF + rerank", "on"), "R@5"]
 num_gap = paired.loc[("B2_rag_cot", "numeric, calculation"), "S − other"]
 look_gap = paired.loc[("B1_plain_rag", "judge, lookup"), "S − other"]
@@ -1543,14 +1596,15 @@ targets = pd.DataFrame([
 ], columns=["target", "goal", "result", "met"]).set_index("target")
 display(targets.round(3))
 
+
 # %% [markdown]
-# ### 6.1 Judge validation
+# ### 6.4 Judge validation
 #
-# A stratified sample of answers from B1, B2 and S is labelled without seeing the judge's verdict (labels as in 3.5). We report agreement and Cohen's κ for the combined verdict and for `phi4-mini` alone. Answers to questions rejected in 3.5/3.6 are not labelled.
+# A stratified sample of answers from B1, B2 and S is labelled without seeing the judge's verdict (labels as in 3.6). We report agreement and Cohen's κ for the combined verdict and for `phi4-mini` alone. Answers to questions rejected in review are not labelled. A label for an answer the predictions no longer contain stops the notebook.
 
 # %%
 val_pool = pd.concat([scored[c].assign(condition=c) for c in ("B1_plain_rag", "B2_rag_cot", "S_agent")])
-val_pool["answer_key"] = ["h" + hashlib.sha1(a.encode()).hexdigest()[:12] for a in val_pool.answer]   # Excel-safe id
+val_pool["answer_key"] = ["h" + hashlib.sha1(a.encode()).hexdigest()[:12] for a in val_pool.answer]
 val_sample = pd.concat([g.sample(min(20, len(g)), random_state=SEED) for _, g in val_pool.groupby("condition")])
 export_once(val_sample[["condition", "qid", "answer_key", "question", "gold_answer", "answer"]].assign(human_correct=""),
             "judge_validation_to_label.csv")
@@ -1573,10 +1627,11 @@ if val_path.exists():
 else:
     print(f"PENDING: {val_path} not provided yet, so judge agreement is not computed")
 
+
 # %% [markdown]
-# ### 6.2 Self-consistency (stretch goal)
+# ### 6.5 Self-consistency (stretch goal)
 #
-# The agent runs 3 times per calculation question (T = 0.7, different seeds). We vote on the first figure in each answer, rounded to 3 significant digits, and keep the winning run's answer and citation. Cost is the sum of the 3 runs.
+# The agent runs 3 times per calculation question (temperature 0.7, different seeds). We vote on the first figure in each answer, rounded to 3 significant digits, and keep the winning run's answer and citation. Cost is the sum of the three runs. The table compares it with the single greedy run.
 
 # %%
 def vote_key(answer):
@@ -1604,8 +1659,9 @@ sc_table = pd.DataFrame([{"condition": n, "judge acc": p.judge_ok.astype(float).
                          for n, p in (("S_agent (greedy, 1 run)", s_calc), ("SC3_agent (3 runs, vote)", scored["SC3_agent"]))])
 display(sc_table.set_index("condition").round(3))
 
+
 # %% [markdown]
-# ### 6.3 Findings
+# ### 6.6 Findings
 #
 # Test set after verification: 318 questions (200 lookups, 42 real and 76 derived calculations). p-values are not corrected for the 16 comparisons.
 #
@@ -1621,7 +1677,9 @@ display(sc_table.set_index("condition").round(3))
 # %% [markdown]
 # ## 7. Error Analysis
 #
-# Every wrong S answer gets an automatic category from its trace: retrieval miss, refused (the right passage was retrieved), calculator not called, wrong figure or formula, wrong figure (lookup), step limit, or judge disagrees (rules passed, LLM judge said no). Each case is then checked, re-categorised where needed and given a fix (`failures_to_categorize__test.csv` → `failures_categorized__test.csv`).
+# ### 7.1 Failure categories
+#
+# Every wrong S answer gets an automatic category from its trace: retrieval miss, refused (the right passage was retrieved), calculator not called, wrong figure or formula, wrong figure (lookup), step limit, or judge disagrees (rules passed, LLM judge said no). The failures are exported, then each is checked, re-categorised where needed and given a fix (`failures_categorized__test.csv`).
 
 # %%
 def auto_category(r):
@@ -1641,14 +1699,14 @@ def auto_category(r):
 
 
 s_res = scored["S_agent"]
-failures = s_res[s_res.judge_ok.map(lambda v: v is False)].copy()   # None = no verdict, not a failure
+failures = s_res[s_res.judge_ok.map(lambda v: v is False)].copy()
 failures["auto_category"] = [auto_category(r) for r in failures.itertuples()]
 failures["answer_key"] = ["h" + hashlib.sha1(a.encode()).hexdigest()[:12] for a in failures.answer]
 print(f"S failures: {len(failures)} of {len(s_res)}")
 display(failures.auto_category.value_counts().rename("failures").to_frame())
 pd.set_option("display.max_colwidth", 160)
 display(failures[["qid", "qtype", "question", "gold_answer", "answer", "auto_category"]].head(25))
-eval_tag = "quick" if QUICK_RUN else "test"       # the full test run has far more failures than the quick subset
+eval_tag = "quick" if QUICK_RUN else "test"
 export_once(failures[["qid", "answer_key", "qtype", "question", "gold_answer", "answer", "auto_category"]]
             .assign(human_category="", what_to_change=""), f"failures_to_categorize__{eval_tag}.csv")
 cat_path = LABELS / f"failures_categorized__{eval_tag}.csv"
@@ -1662,7 +1720,10 @@ if cat_path.exists():
 else:
     print(f"PENDING: {cat_path} not provided yet")
 
+
 # %% [markdown]
+# ### 7.2 What the failures show
+#
 # 47 of 318 S answers are wrong.
 #
 # - 14 are not really system errors. 8 come from ambiguous questions or golds, e.g. a "percentage decrease" between two margins where the gold gives the point change and the agent the relative change. 6 are correct answers marked wrong, e.g. a correct difference where the gold lists both values, or 1.014 against a gold of 1.01.
@@ -1675,14 +1736,14 @@ else:
 # %% [markdown]
 # ## 8. Demo
 #
-# `ask(question, ticker)` runs the full system and prints each tool call, its result, the answer and the cited passage. Both examples are dev questions picked before any test result was seen. A live run can differ (section 9).
+# `ask(question, ticker)` runs the full system live and prints each tool call, its result, the answer and the cited passage. Both examples are dev questions picked before any test result was seen.
 #
-# 1. Success. Hasbro's goodwill impairment plus loss on disposal (gold $1,499.0 million). The model adds $960.0M and $539.0M in its head and writes $1,500.0 million. The guard sees a number no passage states, `run_python` returns 1,499 and the answer is fixed.
-# 2. Failure. How much did NVIDIA's Compute & Networking gross margin decrease? The filing gives only the reason (inventory provisions), not a figure. The agent finds the passage but answers "decreased by 36%", which is the segment's revenue growth. The calculator nudge doesn't change it. Asked "how much", the model would rather give a wrong number than none, and only the citation lets a reader catch it.
+# ### 8.1 Success
+#
+# Hasbro's goodwill impairment plus loss on disposal (gold $1,499.0 million). The model adds $960.0M and $539.0M in its head and writes $1,500.0 million. The guard sees a number no passage states, `run_python` returns 1,499 and the answer is fixed.
 
 # %%
 def ask(question: str, ticker: str = None):
-    """Run the full system on one input and print the answer and the agent trace."""
     rec = run_agent(question, ticker)
     show_trace(rec)
     if rec["cited_doc"] in row_of:
@@ -1693,9 +1754,16 @@ def ask(question: str, ticker: str = None):
 demo_success = ask("What were the non-cash goodwill impairment charge and the loss on disposal of business combined?",
                    ticker="HAS")
 
+
+# %% [markdown]
+# ### 8.2 Failure
+#
+# How much did NVIDIA's Compute & Networking gross margin decrease? The filing gives only the reason (inventory provisions), not a figure. The agent finds the passage but answers "decreased by 36%", which is the segment's revenue growth. The calculator nudge doesn't change it. Asked "how much", the model would rather give a wrong number than none, and only the citation lets a reader catch it.
+
 # %%
 demo_failure = ask("How much did the Compute & Networking segment's gross margin decrease in fiscal year 2023?",
                    ticker="NVDA")
+
 
 # %% [markdown]
 # ## 9. Limitations and Ethics
@@ -1705,7 +1773,7 @@ demo_failure = ask("How much did the Compute & Networking segment's gross margin
 # - **Harm.** A user could trust a confident wrong figure. Every answer cites its passage. This is a reading aid, not financial advice.
 # - **Security.** The calculator runs model-written code. The allow-list and separate process block imports, file access and hangs, but a production system would need a container. Passages could carry prompt injections; a 4B model can be steered by them.
 # - **Privacy and misuse.** Filings are public and no personal data is used. The same pipeline could mass-produce plausible but wrong financial summaries, another reason for citations.
-# - **Evaluation.** Each condition was run once on 318 questions, so small gaps are noise (6). The judge is a small LLM checked against the 3.5 labels. Numeric matching has a 1% tolerance, ignores sign, and can't check scale when the gold has none (gold "$1.60" matches "$1.60 billion").
+# - **Evaluation.** Each condition was run once on 318 questions, so small gaps are noise (6.3). The judge is a small LLM checked against the 3.6 labels. Numeric matching has a 1% tolerance, ignores sign, and can't check scale when the gold has none (gold "$1.60" matches "$1.60 billion").
 # - **Run-to-run variation.** Ollama at T = 0 with a fixed seed is not fully deterministic. A dev question on Coca-Cola's interest paid was right in some runs and wrong in others. Reported numbers are the saved predictions.
 
 # %% [markdown]
@@ -1716,4 +1784,4 @@ demo_failure = ask("How much did the Compute & Networking segment's gross margin
 # - Papers: Yao et al. 2023, ReAct. Chen et al. 2023, Program of Thoughts. Gao et al. 2023, PAL. Wang et al. 2023, Self-Consistency. Chen et al. 2021, FinQA. Zhu et al. 2021, TAT-QA. Islam et al. 2023, FinanceBench. Cormack et al. 2009, Reciprocal Rank Fusion. Robertson and Zaragoza 2009, BM25. Xiao et al. 2023, C-Pack (BGE). Zheng et al. 2023, Judging LLM-as-a-Judge.
 # - Course labs: Module 2 `4_Structured_Generation_Lab` (PAL, self-consistency, structured output); Module 3 `1_RAG_Pipeline_Lab` (BM25, RRF, re-ranking, Recall@k, MRR); Module 4 `1_Multi_Agent_System_End_to_End` and `Agentic_app` (tools, `run_python`, ReAct graph, tool nudge, `check_setup.py`); Module 4 MCP lab (AST calculator).
 # - Software: Ollama, LangGraph, LangChain, FAISS, rank-bm25, sentence-transformers, Hugging Face `datasets`, pandas, matplotlib, jupytext.
-# - AI assistants were used to help write code and to fill in the label files (3.5, 6.1, 7) under the team's supervision.
+# - AI assistants were used to help write code and to fill in the label files (3.6, 6.4, 7) under the team's supervision.
