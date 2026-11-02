@@ -17,11 +17,11 @@
 #
 # | Member | Contribution |
 # |---|---|
-# | Vyom Nikhra | |
-# | Kumarran Mahesh | |
-# | Kommana Srinivasa Rao | |
-# | Adarsh Reddy | |
-# | Vennela Reddy | |
+# | Kumarran Mahesh | Problem statement, research question and targets (1); setup (2) |
+# | Vyom Nikhra | Data pipeline and question set (3); retrieval (5.1–5.3) |
+# | Kommana Srinivasa Rao | Calculator, search tool and agent (5.4–5.12); demo (8) |
+# | Vennela Reddy | Evaluation harness and baseline (4); evaluation and results (6) |
+# | Adarsh Reddy | Error analysis (7); limitations and ethics (9); references (10) |
 
 # %% [markdown]
 # ## 1. Problem Statement
@@ -1661,7 +1661,24 @@ display(sc_table.set_index("condition").round(3))
 
 
 # %% [markdown]
-# ### 6.6 Findings
+# ### 6.6 Results at a glance
+#
+# The numbers the findings below refer to, in one table: judge accuracy overall and on lookups, numeric accuracy on calculations, how often the calculator was used, and tokens per question as a measure of cost.
+
+# %%
+look_acc = {n: scored[n].loc[~scored[n].qtype.isin(CALC_TYPES), "judge_ok"].astype(float).mean() for n in results.index}
+glance = pd.DataFrame({
+    "overall": results["judge acc"],
+    "lookups": pd.Series(look_acc),
+    "calculations (numeric)": results["numeric acc (calc)"],
+    "calculator used": results["calculator used (calc)"],
+    "tokens / question": results["tokens / q"].round(0),
+})
+display(glance.round(3))
+
+
+# %% [markdown]
+# ### 6.7 Findings
 #
 # Test set after verification: 318 questions (200 lookups, 42 real and 76 derived calculations). p-values are not corrected for the 16 comparisons.
 #
@@ -1736,23 +1753,25 @@ else:
 # %% [markdown]
 # ## 8. Demo
 #
-# `ask(question, ticker)` runs the full system live and prints each tool call, its result, the answer and the cited passage. Both examples are dev questions picked before any test result was seen.
+# `ask(question, ticker, gold)` runs the full system live and prints each step: `USER` is the question or a guard nudge, `ACT` a tool call, `OBS` what the tool returned, `MODEL` the model's text. It ends with the answer next to the gold answer, and the cited passage. Both examples are dev questions picked before any test result was seen. Each takes about 10 seconds.
 #
 # ### 8.1 Success
 #
 # Hasbro's goodwill impairment plus loss on disposal (gold $1,499.0 million). The model adds $960.0M and $539.0M in its head and writes $1,500.0 million. The guard sees a number no passage states, `run_python` returns 1,499 and the answer is fixed.
 
 # %%
-def ask(question: str, ticker: str = None):
+def ask(question: str, ticker: str = None, gold: str = None):
     rec = run_agent(question, ticker)
     show_trace(rec)
+    if gold:
+        print(f"\nANSWER {rec['answer']}\nGOLD   {gold}")
     if rec["cited_doc"] in row_of:
         print(f"\ncited passage {rec['cited_doc']}: {doc_text[row_of[rec['cited_doc']]]}")
     return rec
 
 
 demo_success = ask("What were the non-cash goodwill impairment charge and the loss on disposal of business combined?",
-                   ticker="HAS")
+                   ticker="HAS", gold="$1,499.0 million")
 
 
 # %% [markdown]
@@ -1762,7 +1781,18 @@ demo_success = ask("What were the non-cash goodwill impairment charge and the lo
 
 # %%
 demo_failure = ask("How much did the Compute & Networking segment's gross margin decrease in fiscal year 2023?",
-                   ticker="NVDA")
+                   ticker="NVDA", gold="The gross margin of the Compute & Networking segment decreased during fiscal year 2023, "
+                        "primarily because of inventory provisions.")
+
+
+# %% [markdown]
+# ### 8.3 Spare question
+#
+# A third dev question, if time allows or the judges want another run: what share of Apple's notes falls due within 12 months. The agent should search, call `run_python` with 9.9 / 106.6 and answer about 9.3%.
+
+# %%
+demo_spare = ask("What percentage of total Notes did the $9.9 billion payable within 12 months represent?",
+                 ticker="AAPL", gold="9.3%")
 
 
 # %% [markdown]
