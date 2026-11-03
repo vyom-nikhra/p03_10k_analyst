@@ -4,8 +4,10 @@
 #     text_representation:
 #       extension: .py
 #       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.6
 #   kernelspec:
-#     display_name: Python 3
+#     display_name: Python 3 (ipykernel)
 #     language: python
 #     name: python3
 # ---
@@ -1410,11 +1412,6 @@ display(pd.DataFrame(dev_runs))
 
 
 # %% [markdown]
-# ### 5.12 Fine-tuning
-#
-# Not required by the brief, and not done.
-
-# %% [markdown]
 # ## 6. Evaluation
 #
 # ### 6.1 Conditions
@@ -1814,4 +1811,5 @@ demo_spare = ask("What percentage of total Notes did the $9.9 billion payable wi
 # - Papers: Yao et al. 2023, ReAct. Chen et al. 2023, Program of Thoughts. Gao et al. 2023, PAL. Wang et al. 2023, Self-Consistency. Chen et al. 2021, FinQA. Zhu et al. 2021, TAT-QA. Islam et al. 2023, FinanceBench. Cormack et al. 2009, Reciprocal Rank Fusion. Robertson and Zaragoza 2009, BM25. Xiao et al. 2023, C-Pack (BGE). Zheng et al. 2023, Judging LLM-as-a-Judge.
 # - Course labs: Module 2 `4_Structured_Generation_Lab` (PAL, self-consistency, structured output); Module 3 `1_RAG_Pipeline_Lab` (BM25, RRF, re-ranking, Recall@k, MRR); Module 4 `1_Multi_Agent_System_End_to_End` and `Agentic_app` (tools, `run_python`, ReAct graph, tool nudge, `check_setup.py`); Module 4 MCP lab (AST calculator).
 # - Software: Ollama, LangGraph, LangChain, FAISS, rank-bm25, sentence-transformers, Hugging Face `datasets`, pandas, matplotlib, jupytext.
-# - AI assistants were used to help write code and to fill in the label files (3.6, 6.4, 7) under the team's supervision.
+
+# %%
