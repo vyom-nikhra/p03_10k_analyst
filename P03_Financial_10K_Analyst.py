@@ -1526,13 +1526,11 @@ plt.show()
 
 
 # %% [markdown]
-# ### 6.3 Uncertainty and paired tests
+# ### 6.3 Uncertainty and paired comparisons
 #
-# With a few hundred questions, a gap of a few points can be noise. Each accuracy gets a 95% bootstrap interval (10,000 resamples of the questions). Since every condition answers the same questions, S is compared with each other condition pairwise: a bootstrap interval on the per-question difference, and McNemar's exact test on the questions only one of the two got right. The last table checks the targets from section 1.
+# With a few hundred questions, a gap of a few points can be noise. Each accuracy gets a 95% bootstrap interval (10,000 resamples of the questions). Since every condition answers the same questions, S is compared with each other condition pairwise: a bootstrap interval on the per-question difference, plus how many questions only one of the two got right. A difference whose interval includes 0 could be noise. The last table checks the targets from section 1.
 
 # %%
-from scipy.stats import binomtest
-
 N_BOOT = 10_000
 boot_rng = np.random.default_rng(SEED)
 
@@ -1574,10 +1572,9 @@ for other in ("B2_rag_cot", "B1_plain_rag", "A2_agent_no_calculator", "A1_agent_
         diff = both.S - both.other
         lo, hi = boot_ci(diff)
         s_only, other_only = int((diff > 0).sum()), int((diff < 0).sum())
-        p = binomtest(s_only, s_only + other_only, 0.5).pvalue if s_only + other_only else 1.0
         paired_rows.append({"S vs": other, "metric": m, "n": len(both), "S − other": round(diff.mean(), 3),
                             "95% CI": f"[{lo:.3f}, {hi:.3f}]", "only S right": s_only,
-                            "only other right": other_only, "McNemar p": round(p, 4)})
+                            "only other right": other_only})
 paired = pd.DataFrame(paired_rows).set_index(["S vs", "metric"])
 display(paired)
 
@@ -1677,13 +1674,13 @@ display(glance.round(3))
 # %% [markdown]
 # ### 6.7 Findings
 #
-# Test set after verification: 318 questions (200 lookups, 42 real and 76 derived calculations). p-values are not corrected for the 16 comparisons.
+# Test set after verification: 318 questions (200 lookups, 42 real and 76 derived calculations). Differences are S minus the other condition, with 95% bootstrap intervals.
 #
-# - Overall S is level with RAG + CoT: 0.852 vs 0.849 (difference +0.003, 95% CI −0.041 to 0.047), and with A2 (0.855). It is 4 points above plain RAG, which is not significant (p = 0.12). So the answer to the research question is no.
-# - On lookups S is best: 0.890 vs 0.825 (B1) and 0.835 (B2), p = 0.05 for both. The lookup target is met.
-# - On calculations S is worse than RAG + CoT: numeric accuracy 0.805 vs 0.898 (−0.093, CI −0.169 to −0.017, p = 0.03). The +15 point target is missed by a wide margin.
-# - The calculator is called on 66% of calculation questions (target 90%). Removing it costs 4 points, within noise (p = 0.30). Section 7 shows why.
-# - The ticker filter matters most. Without it accuracy drops 20 points (0.852 to 0.654, p < 0.001) because answers come from the wrong company. A1's latency is inflated by a GPU memory slowdown during that run.
+# - Overall S is level with RAG + CoT: 0.852 vs 0.849 (difference +0.003, 95% CI −0.041 to 0.047), and with A2 (0.855). It is 4 points above plain RAG, within noise (CI −0.006 to 0.088). So the answer to the research question is no.
+# - On lookups S is best: 0.890 vs 0.825 (B1) and 0.835 (B2); both intervals lie just above 0 (CI 0.005 to 0.125 and 0.005 to 0.105). The lookup target is met.
+# - On calculations S is worse than RAG + CoT: numeric accuracy 0.805 vs 0.898 (−0.093, CI −0.169 to −0.017). The +15 point target is missed by a wide margin.
+# - The calculator is called on 66% of calculation questions (target 90%). Removing it costs 4 points, within noise (CI −0.017 to 0.110). Section 7 shows why.
+# - The ticker filter matters most. Without it accuracy drops 20 points (0.852 to 0.654, CI 0.148 to 0.252) because answers come from the wrong company. A1's latency is inflated by a GPU memory slowdown during that run.
 # - Self-consistency lifts numeric accuracy from 0.805 to 0.839 for 2.9× the calls and tokens.
 # - S uses about 3 calls and 3,100 tokens per question, B2 one call and 640 tokens.
 # - The combined judge agrees with the labels on 93% of answers (κ = 0.73); `phi4-mini` alone on 89% (κ = 0.50).
