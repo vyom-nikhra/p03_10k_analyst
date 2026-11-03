@@ -19,11 +19,11 @@
 #
 # | Member | Contribution |
 # |---|---|
-# | Kumarran Mahesh | Problem statement, research question and targets (1); setup (2) |
-# | Vyom Nikhra | Data pipeline and question set (3); retrieval (5.1–5.3) |
-# | Kommana Srinivasa Rao | Calculator, search tool and agent (5.4–5.12); demo (8) |
-# | Vennela Reddy | Evaluation harness and baseline (4); evaluation and results (6) |
-# | Adarsh Reddy | Error analysis (7); limitations and ethics (9); references (10) |
+# | Kumarran Mahesh | Problem framing, research question and success targets; environment setup and portability (requirements, Ollama/Colab setup, environment check); data loading, exploration and knowledge base; dev/test splits |
+# | Vyom Nikhra | Number parser; question-type tagging and label checks; derived calculation question pipeline; evaluation harness and scoring (rule gates + LLM judge) |
+# | Kommana Srinivasa Rao | Hybrid retrieval (BM25, dense, fusion, re-ranker, ticker filter) and its evaluation; search tool; ReAct agent graph, prompt and guard |
+# | Vennela Reddy | Baselines (closed book, plain RAG, RAG + chain-of-thought); ablations; results table and charts; key comparisons; judge validation |
+# | Adarsh Reddy | Calculator tool: sandbox (code allow-list, isolated process, timeout) and its tests; self-consistency stretch goal; error analysis; demo |
 
 # %% [markdown]
 # ## 1. Problem Statement
