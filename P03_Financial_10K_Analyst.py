@@ -1526,61 +1526,31 @@ plt.show()
 
 
 # %% [markdown]
-# ### 6.3 Uncertainty and paired comparisons
+# ### 6.3 Key comparisons and targets
 #
-# With a few hundred questions, a gap of a few points can be noise. Each accuracy gets a 95% bootstrap interval (10,000 resamples of the questions). Since every condition answers the same questions, S is compared with each other condition pairwise: a bootstrap interval on the per-question difference, plus how many questions only one of the two got right. A difference whose interval includes 0 could be noise. The last table checks the targets from section 1.
+# The differences that answer the research question: S against each baseline and ablation on the same questions. Each condition was run once, so a gap of a few points can be noise. The second table checks the targets from section 1.
 
 # %%
-N_BOOT = 10_000
-boot_rng = np.random.default_rng(SEED)
+def accuracy(p, col, group):
+    if group != "all":
+        is_calc = p.qtype.isin(CALC_TYPES)
+        p = p[is_calc] if group == "calculation" else p[~is_calc]
+    return p[col].dropna().astype(float).mean()
 
 
-def in_group(p, group):
-    if group == "all":
-        return p
-    return p[p.qtype.isin(CALC_TYPES)] if group == "calculation" else p[~p.qtype.isin(CALC_TYPES)]
-
-
-def outcome(p, col):
-    s = p.set_index("qid")[col]
-    return s[s.notna()].astype(float)
-
-
-def boot_ci(x):
-    x = np.asarray(x, dtype=float)
-    means = x[boot_rng.integers(0, len(x), size=(N_BOOT, len(x)))].mean(axis=1)
-    return np.percentile(means, [2.5, 97.5])
-
-
-def fmt_ci(x):
-    lo, hi = boot_ci(x)
-    return f"{np.mean(x):.3f} [{lo:.3f}, {hi:.3f}]"
-
-
-METRICS = [("judge, all", "judge_ok", "all"), ("judge, lookup", "judge_ok", "lookup"),
-           ("judge, calculation", "judge_ok", "calculation"), ("numeric, calculation", "numeric_ok", "calculation")]
-ci_table = pd.DataFrame({name: {m: fmt_ci(outcome(in_group(p, g), col)) for m, col, g in METRICS}
-                         for name, p in scored.items()}).T
-ci_table.index.name = "condition (accuracy [95% CI])"
-display(ci_table)
-
-paired_rows = []
-for other in ("B2_rag_cot", "B1_plain_rag", "A2_agent_no_calculator", "A1_agent_no_ticker_filter"):
-    for m, col, g in METRICS:
-        both = pd.concat([outcome(in_group(scored["S_agent"], g), col).rename("S"),
-                          outcome(in_group(scored[other], g), col).rename("other")], axis=1, join="inner")
-        diff = both.S - both.other
-        lo, hi = boot_ci(diff)
-        s_only, other_only = int((diff > 0).sum()), int((diff < 0).sum())
-        paired_rows.append({"S vs": other, "metric": m, "n": len(both), "S − other": round(diff.mean(), 3),
-                            "95% CI": f"[{lo:.3f}, {hi:.3f}]", "only S right": s_only,
-                            "only other right": other_only})
-paired = pd.DataFrame(paired_rows).set_index(["S vs", "metric"])
-display(paired)
+COLS = {"judge acc": "judge_ok", "numeric acc": "numeric_ok"}
+COMPARISONS = [("B2_rag_cot", "judge acc", "all"), ("B2_rag_cot", "judge acc", "lookup"),
+               ("B2_rag_cot", "numeric acc", "calculation"), ("B1_plain_rag", "judge acc", "lookup"),
+               ("A2_agent_no_calculator", "numeric acc", "calculation"), ("A1_agent_no_ticker_filter", "judge acc", "all")]
+compare = pd.DataFrame([{"S vs": other, "metric": f"{m}, {g}", "S": accuracy(scored["S_agent"], COLS[m], g),
+                         "other": accuracy(scored[other], COLS[m], g)} for other, m, g in COMPARISONS])
+compare["S − other"] = compare.S - compare.other
+compare = compare.set_index(["S vs", "metric"])
+display(compare.round(3))
 
 r5 = retrieval_table.set_index(["retriever", "ticker filter"]).loc[("hybrid RRF + rerank", "on"), "R@5"]
-num_gap = paired.loc[("B2_rag_cot", "numeric, calculation"), "S − other"]
-look_gap = paired.loc[("B1_plain_rag", "judge, lookup"), "S − other"]
+num_gap = compare.loc[("B2_rag_cot", "numeric acc, calculation"), "S − other"]
+look_gap = compare.loc[("B1_plain_rag", "judge acc, lookup"), "S − other"]
 calc_use = results.loc["S_agent", "calculator used (calc)"]
 targets = pd.DataFrame([
     ("retrieval Recall@5 (hybrid + rerank, filter on)", "≥ 0.90", r5, r5 >= 0.90),
@@ -1674,13 +1644,13 @@ display(glance.round(3))
 # %% [markdown]
 # ### 6.7 Findings
 #
-# Test set after verification: 318 questions (200 lookups, 42 real and 76 derived calculations). Differences are S minus the other condition, with 95% bootstrap intervals.
+# Test set after verification: 318 questions (200 lookups, 42 real and 76 derived calculations). Differences are S minus the other condition. Each condition was run once, so gaps of a few points may be noise.
 #
-# - Overall S is level with RAG + CoT: 0.852 vs 0.849 (difference +0.003, 95% CI −0.041 to 0.047), and with A2 (0.855). It is 4 points above plain RAG, within noise (CI −0.006 to 0.088). So the answer to the research question is no.
-# - On lookups S is best: 0.890 vs 0.825 (B1) and 0.835 (B2); both intervals lie just above 0 (CI 0.005 to 0.125 and 0.005 to 0.105). The lookup target is met.
-# - On calculations S is worse than RAG + CoT: numeric accuracy 0.805 vs 0.898 (−0.093, CI −0.169 to −0.017). The +15 point target is missed by a wide margin.
-# - The calculator is called on 66% of calculation questions (target 90%). Removing it costs 4 points, within noise (CI −0.017 to 0.110). Section 7 shows why.
-# - The ticker filter matters most. Without it accuracy drops 20 points (0.852 to 0.654, CI 0.148 to 0.252) because answers come from the wrong company. A1's latency is inflated by a GPU memory slowdown during that run.
+# - Overall S is level with RAG + CoT: 0.852 vs 0.849 (+0.003), and with A2 (0.855). It is 4 points above plain RAG. So the answer to the research question is no.
+# - On lookups S is best: 0.890 vs 0.825 (B1) and 0.835 (B2). The lookup target is met.
+# - On calculations S is worse than RAG + CoT: numeric accuracy 0.805 vs 0.898 (−0.093). The +15 point target is missed by a wide margin.
+# - The calculator is called on 66% of calculation questions (target 90%). Removing it costs only 4 points. Section 7 shows why.
+# - The ticker filter matters most. Without it accuracy drops 20 points (0.852 to 0.654) because answers come from the wrong company. A1's latency is inflated by a GPU memory slowdown during that run.
 # - Self-consistency lifts numeric accuracy from 0.805 to 0.839 for 2.9× the calls and tokens.
 # - S uses about 3 calls and 3,100 tokens per question, B2 one call and 640 tokens.
 # - The combined judge agrees with the labels on 93% of answers (κ = 0.73); `phi4-mini` alone on 89% (κ = 0.50).
@@ -1797,7 +1767,7 @@ demo_spare = ask("What percentage of total Notes did the $9.9 billion payable wi
 # - **Harm.** A user could trust a confident wrong figure. Every answer cites its passage. This is a reading aid, not financial advice.
 # - **Security.** The calculator runs model-written code. The allow-list and separate process block imports, file access and hangs, but a production system would need a container. Passages could carry prompt injections; a 4B model can be steered by them.
 # - **Privacy and misuse.** Filings are public and no personal data is used. The same pipeline could mass-produce plausible but wrong financial summaries, another reason for citations.
-# - **Evaluation.** Each condition was run once on 318 questions, so small gaps are noise (6.3). The judge is a small LLM checked against the 3.6 labels. Numeric matching has a 1% tolerance, ignores sign, and can't check scale when the gold has none (gold "$1.60" matches "$1.60 billion").
+# - **Evaluation.** Each condition was run once on 318 questions, so small gaps may be noise. The judge is a small LLM checked against the 3.6 labels. Numeric matching has a 1% tolerance, ignores sign, and can't check scale when the gold has none (gold "$1.60" matches "$1.60 billion").
 # - **Run-to-run variation.** Ollama at T = 0 with a fixed seed is not fully deterministic. A dev question on Coca-Cola's interest paid was right in some runs and wrong in others. Reported numbers are the saved predictions.
 
 # %% [markdown]
