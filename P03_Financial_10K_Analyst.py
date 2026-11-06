@@ -1393,7 +1393,7 @@ def show_trace(rec):
 # %% [markdown]
 # ### 5.11 Agent on dev questions
 #
-# Two dev questions of each type, run live, with full traces. Prompts and guards were tuned on dev only. A live run can differ slightly from earlier runs (section 9).
+# Two dev questions of each type, run live, with full traces. Prompts and guards were tuned on dev only. A live run can differ slightly from earlier runs (section 10).
 
 # %%
 dev_q = questions[questions.split == "dev"]
@@ -1760,7 +1760,222 @@ demo_spare = ask("What percentage of total Notes did the $9.9 billion payable wi
 
 
 # %% [markdown]
-# ## 9. Limitations and Ethics
+# ## 9. Follow-up: Reliable Tool Use (Agent v4)
+#
+# Feedback after the presentation: the agent has two tools, and search always runs first anyway, so the only real choice is whether to use the calculator. Why does a model get that one choice wrong, even after nudges? This section measures why (9.1), changes the design (9.2), and re-runs the test set (9.4). The change was prompted by feedback and by the test-set failures in section 7, so the v4 numbers are not a clean held-out result.
+#
+# ### 9.1 Why the agent skipped its tools
+#
+# For every nudge in the saved S runs, the cell records which nudge fired, on which kind of question, whether the model then called a tool, and whether it just repeated its previous answer. It also checks how often the first turn was a search, and how often calculation questions answered without the calculator were still right.
+
+# %%
+NUDGE_KEYS = {"search_filings before": "search", "calculated figure": "calc_question", "not written in the retrieved": "calc"}
+
+
+def nudge_kind(text):
+    return next((kind for key, kind in NUDGE_KEYS.items() if key in text), None)
+
+
+def final_text(step):
+    return step["content"].split("Answer:")[-1].split("Source:")[0].strip()
+
+
+rows = []
+for r in s_res.itertuples():
+    for i, step in enumerate(r.trace):
+        kind = nudge_kind(step["content"]) if step["role"] == "HumanMessage" and i else None
+        if not kind:
+            continue
+        before = next((t for t in reversed(r.trace[:i]) if t["role"] == "AIMessage" and not t["tool_calls"]), None)
+        after = next((t for t in r.trace[i + 1:] if t["role"] == "AIMessage"), None)
+        rows.append({"nudge": kind, "question": "calculation" if r.qtype in CALC_TYPES else "lookup",
+                     "tool called": bool(after and after["tool_calls"]),
+                     "same answer": bool(after and before and not after["tool_calls"] and final_text(after) == final_text(before))})
+nudge_log = pd.DataFrame(rows)
+display(nudge_log.groupby(["nudge", "question"]).agg(fired=("nudge", "size"), then_tool_call=("tool called", "sum"),
+                                                     then_same_answer=("same answer", "sum")))
+
+first_search = s_res.trace.map(lambda t: bool(next(s for s in t if s["role"] == "AIMessage")["tool_calls"]))
+print(f"first turn was a search: {int(first_search.sum())} of {len(s_res)}; "
+      f"never searched: {int((s_res.retrieved_docs.str.len() == 0).sum())}")
+calc_s = s_res[s_res.qtype.isin(CALC_TYPES)]
+display(calc_s.groupby("calc_called").agg(questions=("qid", "size"), judge_acc=("judge_ok", lambda s: s.astype(float).mean()))
+        .rename(index={True: "calculator used", False: "calculator skipped"}))
+
+
+# %% [markdown]
+# Three causes:
+# - **Search was optional although it was required.** On some questions the first turn was an answer, not a search, and four questions were never searched.
+# - **The model saw its rejected answer.** A nudge is added after the draft, and at temperature 0 the model mostly repeats that draft word for word.
+# - **The keyword nudge often fired on lookups.** "What percentage of electricity was green power?" contains "percentage" but needs no arithmetic, so the model was right to ignore it. That nudge never led to a calculator call.
+#
+# ### 9.2 Agent v4: retrieve first, then a structured answer
+#
+# v4 stops asking the model to choose tools:
+# 1. The harness searches with the question before the model sees anything, as in the RAG baselines.
+# 2. The model replies in a fixed JSON form that Ollama enforces: whether a calculation is needed, the Python expression, a draft answer and the source passage. A yes/no field can't be skipped the way a tool call can.
+# 3. If a calculation is needed, the code always runs the expression in the 5.5 sandbox, and a short second call rewrites the draft so it states the computed figure exactly, in the draft's units.
+# 4. The model can still answer "no calculation" and do the sum in its head, or just repeat the two figures without combining them. So the code checks the draft: if it contains a number that no passage or question states, or the question asks for a change, total, ratio or percentage while the draft only repeats passage figures, the harness asks for only a Python expression (a schema with one field) and goes to step 3. The code makes the decision; the model only writes the expression.
+# 5. No guard node and no nudges.
+#
+# Two details matter for a 4B model. Ollama enforces the shape of the JSON but never shows the model what the fields mean, so the prompt explains them with two examples. And the fields are written in alphabetical order, so their names put the decision first: `calculation_needed`, then `expression`, then `final_answer`. A first version with a free-text "search again" field failed on dev: the model filled it with the whole prompt until the output was cut off.
+#
+# `run_agent_v4` returns the same fields as `run_agent`, so scoring and `show_trace` work unchanged. The search and calculator steps appear in the trace as `ACT` lines.
+
+# %%
+class AnswerPlan(BaseModel):
+    calculation_needed: bool
+    expression: str = Field(max_length=200)
+    final_answer: str = Field(max_length=400)
+    source: str = Field(max_length=20)
+
+
+class CalcOnly(BaseModel):
+    expression: str = Field(max_length=200)
+
+
+PLAN_PROMPT = """You are a careful financial analyst answering a question about a company's 10-K filing.
+Passages from the filing:
+{passages}
+
+{question}
+
+Reply with JSON with these fields:
+- calculation_needed: true if the answer is a difference, change, percentage, ratio or total that the passages do not state, otherwise false
+- expression: if calculation_needed, one Python expression with the figures copied from the passages; otherwise ""
+- final_answer: the answer in one or two sentences with the figures and their units; if calculation_needed, the calculated figure in it will be replaced by the calculator's result
+- source: the id of the passage the figures come from
+
+Never do arithmetic yourself. Examples:
+{{"calculation_needed": false, "expression": "", "final_answer": "Revenue was $1,250.4 million in 2023.", "source": "D99999"}}
+{{"calculation_needed": true, "expression": "(1250.4 - 1102.9) / 1102.9 * 100", "final_answer": "Revenue grew by X% from $1,102.9 million in 2022 to $1,250.4 million in 2023.", "source": "D99999"}}"""
+CALC_PROMPT = """Passages from the filing:
+{passages}
+
+{question}
+
+Draft answer: {draft}
+{reason}
+Reply with JSON with one field: expression, one Python expression with the figures copied from the passages that gives the figure the question asks for.
+Example: {{"expression": "960.0 + 539.0"}}"""
+COMPOSE_PROMPT = """Question: {question}
+Draft answer: {draft}
+Correct result of the calculation {expression}: {result}
+Write the final answer in one or two sentences. State {result} as the calculated figure, in the same unit as the figures in the calculation (for example million, billion or %). If the draft states a different calculated figure, replace it. Do not mention the calculation itself."""
+
+
+def trace_step(role, content, calls=(), name=None):
+    return {"role": role, "content": content[:1500], "tool_calls": list(calls), "name": name}
+
+
+def run_agent_v4(question, ticker=None):
+    llm = get_llm(CONFIG["agent_model"], num_ctx=CONFIG["agent_num_ctx"])
+    user = f"Company ticker: {ticker}\nQuestion: {question}" if ticker else f"Question: {question}"
+    t0 = time.time()
+    hits = retrieve(question, ticker, k=CONFIG["top_k"])
+    passages = format_passages(hits)
+    calls = [{"name": "search_filings", "args": {"query": question, "ticker": ticker}}]
+    trace = [trace_step("HumanMessage", user), trace_step("AIMessage", "", calls),
+             trace_step("ToolMessage", passages, name="search_filings")]
+    usage = []
+
+    def ask_json(schema, prompt):
+        out = llm.with_structured_output(schema, method="json_schema", include_raw=True).invoke(prompt)
+        usage.append(out["raw"].usage_metadata or {})
+        trace.append(trace_step("AIMessage", out["raw"].content))
+        return out["parsed"], out["raw"].content
+
+    p, raw = ask_json(AnswerPlan, PLAN_PROMPT.format(passages=passages, question=user))
+    if p is None:
+        answer, source, expression = raw, "", ""
+    else:
+        answer, source = p.final_answer, p.source
+        expression = p.expression.strip() if p.calculation_needed else ""
+        unsupported = answer_numbers_unsupported(answer, [doc_text[i] for i, _ in hits] + [question])
+        repeats_only = CALC_INTENT_RE.search(question) and len(extract_numbers(answer)) >= 2
+        if not expression and (unsupported or repeats_only):
+            reason = (f"The figure {', '.join(fmt_number(v) for v in unsupported)} is not written in any passage, so it has to be "
+                      "calculated." if unsupported else
+                      "The question asks for a calculated figure, but the draft only repeats figures from the passages.")
+            fix, _ = ask_json(CalcOnly, CALC_PROMPT.format(passages=passages, question=user, draft=answer, reason=reason))
+            expression = fix.expression.strip() if fix is not None else ""
+    if expression:
+        result = run_python_code(expression.replace("$", "").replace("%", ""))
+        calls.append({"name": "run_python", "args": {"code": expression}})
+        trace += [trace_step("AIMessage", "", calls[-1:]), trace_step("ToolMessage", result, name="run_python")]
+        answer = answer or result
+        if result.startswith("answer ="):
+            answer, cost = answer_from_llm(agent_llm, COMPOSE_PROMPT.format(
+                question=question, draft=answer, expression=expression, result=result.split("=", 1)[1].strip()))
+            usage.append(cost)
+            trace.append(trace_step("AIMessage", answer))
+    cited = re.search(r"D\d{5}", source or "")
+    return {
+        "answer": answer.strip(),
+        "raw_final": trace[-1]["content"],
+        "cited_doc": cited.group(0) if cited else None,
+        "tool_calls": calls,
+        "retrieved_docs": sorted(doc_ids[i] for i, _ in hits),
+        "tool_errors": sum(s["role"] == "ToolMessage" and s["content"].startswith("Error") for s in trace),
+        "llm_calls": len(usage),
+        "nudges": [],
+        "steps": len(usage),
+        "input_tokens": sum(u.get("input_tokens", 0) for u in usage),
+        "output_tokens": sum(u.get("output_tokens", 0) for u in usage),
+        "latency_s": round(time.time() - t0, 2),
+        "trace": trace,
+    }
+
+
+# %% [markdown]
+# ### 9.3 v4 on the two demo questions
+#
+# The same Hasbro and NVIDIA questions as in 8.1 and 8.2, now with v4. If the model adds the Hasbro figures in its head, the check in step 4 catches the unstated total and sends it to `run_python`. NVIDIA tests whether v4 still invents a figure when the filing gives none.
+
+# %%
+V4_DEMO = [
+    ("What were the non-cash goodwill impairment charge and the loss on disposal of business combined?", "HAS",
+     "$1,499.0 million"),
+    ("How much did the Compute & Networking segment's gross margin decrease in fiscal year 2023?", "NVDA",
+     "It decreased, primarily because of inventory provisions (no figure given)"),
+]
+for question, ticker, gold in V4_DEMO:
+    rec = run_agent_v4(question, ticker)
+    print(f"\n=== {question}")
+    show_trace(rec)
+    print(f"ANSWER {rec['answer']}\nGOLD   {gold}")
+
+
+# %% [markdown]
+# ### 9.4 v4 on the test set
+#
+# v4 (S4) runs on the same 318 test questions and is scored exactly like the other conditions. The table compares it with the presented agent (S, v3), RAG + chain-of-thought (B2) and the agent without a calculator (A2).
+
+# %%
+scored["S4_agent"] = score("S4_agent", run_condition("S4_agent", lambda r: run_agent_v4(r.question, r.ticker), "v4"))
+HAS_TOOLS.add("S4_agent")
+v4_names = ["B2_rag_cot", "A2_agent_no_calculator", "S_agent", "S4_agent"]
+v4_table = pd.DataFrame([summarize(n, scored[n]) for n in v4_names]).set_index("condition")
+v4_table.insert(1, "judge: lookups", [accuracy(scored[n], "judge_ok", "lookup") for n in v4_names])
+display(v4_table[["judge acc", "judge: lookups", "numeric acc (calc)", "calculator used (calc)", "calculator used (lookup)",
+                  "gold passage retrieved", "refusal rate", "LLM calls / q", "tokens / q", "s / question"]].round(3))
+print("never searched:", {n: int((scored[n].retrieved_docs.str.len() == 0).sum()) for n in ["S_agent", "S4_agent"]})
+
+
+# %% [markdown]
+# ### 9.5 What changed
+#
+# - **The calculator is used.** v4 runs it on 97% of calculation questions (v3: 66%), so the 90% target is now met. Numeric accuracy on calculations rises from 0.805 to 0.873, close to RAG + CoT's 0.898.
+# - **Search can't be skipped.** No question goes unsearched (v3: 4), and refusals fall from 2.5% to 0.6%.
+# - **It is cheaper.** About 1.7 LLM calls and 900 tokens per question, against 2.9 calls and 3,100 tokens for v3.
+# - **Overall accuracy is unchanged** (0.855 vs 0.852). Lookups fall from 0.890 to 0.875: the check in step 4 also sends some lookups through the calculator (13.5%), when the question says "change" and the answer lists two figures.
+# - **The NVIDIA question still gets an invented figure** (6.6 points). A fixed answer form can't stop the model reading a number that isn't there; the citation is still what lets a reader catch it.
+#
+# How v4 got here, on the test set, so its numbers are indicative rather than a clean held-out result: structured output alone (steps 1–3) used the calculator on only 60% of calculation questions and scored 0.746, because the model answered "no calculation" and added in its head. Adding the unstated-number check raised use to 78%, but the rewrite step lost units ("$629 thousand") and rounded 1,499 to 1,500 (0.737). The final version also catches drafts that only repeat the two figures, and gives the rewrite step the draft and the exact result.
+
+
+# %% [markdown]
+# ## 10. Limitations and Ethics
 #
 # - **Failures** (section 7). The model still picks the wrong figure: wrong year, wrong line item, thousands read as millions. The calculator fixes arithmetic, not extraction, which matches the Program-of-Thoughts error analysis. Questions that only say "the company" are hard to retrieve for, and without the ticker filter answers can come from another company.
 # - **Data.** The Q&A pairs were LLM-generated from one 2023 10-K for each of 69 mostly large US companies. About 50 gold answers contain facts not in their passage. The derived questions are synthetic, and 82 of 169 were rejected on review. Results may not carry over to full filings, other years, tables or smaller firms.
@@ -1771,7 +1986,7 @@ demo_spare = ask("What percentage of total Notes did the $9.9 billion payable wi
 # - **Run-to-run variation.** Ollama at T = 0 with a fixed seed is not fully deterministic. A dev question on Coca-Cola's interest paid was right in some runs and wrong in others. Reported numbers are the saved predictions.
 
 # %% [markdown]
-# ## 10. References
+# ## 11. References
 #
 # - Dataset: `virattt/financial-qa-10K` (Hugging Face), revision `30e48b49ef40389cce6488b0bddef7d6f00f4c7a`.
 # - Models: Qwen3-4B-Instruct-2507 (`qwen3:4b-instruct`, agent and baselines); Phi-4-mini-instruct (`phi4-mini`, judge and question generator); BAAI/bge-small-en-v1.5 and all-MiniLM-L6-v2 (embeddings); cross-encoder/ms-marco-MiniLM-L-6-v2 (re-ranker).
